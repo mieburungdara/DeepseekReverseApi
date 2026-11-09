@@ -20,7 +20,7 @@ PORT = 17530
 BASE = f"http://127.0.0.1:{PORT}"
 
 
-def post(body, headers=None):
+def post(body, headers=None, retries=5, wait=25):
     h = {"Content-Type": "application/json", "Authorization": "Bearer sk-uji"}
     h.update(headers or {})
     req = urllib.request.Request(
@@ -29,7 +29,17 @@ def post(body, headers=None):
         headers=h,
         method="POST",
     )
-    return json.loads(urllib.request.urlopen(req, timeout=180).read())
+    last = None
+    for _ in range(retries):
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=180).read())
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            last = e
+            print(f"  [429 rate limit, tunggu {wait}s]")
+            time.sleep(wait)
+    raise last  # type: ignore[misc]
 
 
 def get(path):

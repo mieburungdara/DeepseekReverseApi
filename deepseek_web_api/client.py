@@ -20,6 +20,7 @@ import json
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional
 
 import httpx
@@ -48,6 +49,15 @@ SESSION_CREATE_PATH = "/api/v0/chat_session/create"
 SESSION_FETCH_PATH = "/api/v0/chat_session/fetch_page"
 HISTORY_PATH = "/api/v0/chat/history_messages"
 CURRENT_USER_PATH = "/api/v0/users/current"
+
+
+@dataclass
+class TurnResult:
+    """Hasil satu giliran percakapan."""
+
+    text: str
+    thinking: str
+    response_id: str
 
 
 class DeepSeekWebClient:
@@ -506,12 +516,12 @@ class DeepSeekWebClient:
         chat_session_id: str,
         parent_message_id: Optional[str | int] = None,
         **kwargs: Any,
-    ) -> tuple[str, str]:
-        """Satu giliran percakapan; return ``(jawaban, response_message_id)``.
+    ) -> "TurnResult":
+        """Satu giliran percakapan.
 
-        Simpan ``response_message_id`` dan kirim balik sebagai
-        ``parent_message_id`` pada giliran berikutnya agar server menyambung
-        konteks percakapan.
+        Return :class:`TurnResult` berisi ``text`` (jawaban), ``thinking``
+        (proses berpikir model expert, kosong untuk mode instant), dan
+        ``response_id`` untuk dipakai sebagai ``parent_message_id`` berikutnya.
         """
         accumulator = DeltaAccumulator()
         response_id: Optional[str] = None
@@ -541,7 +551,11 @@ class DeepSeekWebClient:
             # Fallback: ambil dari objek respons asisten.
             mid = accumulator.response.get("message_id")
             response_id = str(mid) if mid is not None else ""
-        return accumulator.answer_text(), response_id
+        return TurnResult(
+            text=accumulator.answer_text(),
+            thinking=accumulator.thinking_text(),
+            response_id=response_id,
+        )
 
     async def stream_turn(
         self,
@@ -552,8 +566,12 @@ class DeepSeekWebClient:
         on_response_id: Optional[Any] = None,
         include_thinking: bool = False,
         **kwargs: Any,
-    ) -> AsyncIterator[str]:
-        """Streaming satu giliran, sekaligus melaporkan ``response_message_id``.
+    ) -> AsyncIterator[tuple[str, str]]:
+        """Streaming satu giliran; yield ``(jenis, teks)``.
+
+        ``jenis`` bernilai ``"thinking"`` untuk proses berpikir model expert
+        atau ``"content"`` untuk jawaban terlihat. Model instant hanya
+        menghasilkan ``"content"``.
 
         ``on_response_id`` dipanggil sekali dengan id pesan asisten begitu
         event ``ready`` diterima, supaya pemanggil bisa menyimpannya sebagai
@@ -595,12 +613,12 @@ class DeepSeekWebClient:
             if include_thinking:
                 think = accumulator.thinking_text()
                 if len(think) > emitted_think:
-                    yield think[emitted_think:]
+                    yield ("thinking", think[emitted_think:])
                     emitted_think = len(think)
 
             answer = accumulator.answer_text()
             if len(answer) > emitted_answer:
-                yield answer[emitted_answer:]
+                yield ("content", answer[emitted_answer:])
                 emitted_answer = len(answer)
 
         # Bila "ready" tidak pernah datang, ambil id dari objek respons.
@@ -687,6 +705,7 @@ def _extract_text(event: dict[str, Any]) -> str:
         return ""
     content = data.get("content") or data.get("text") or ""
     return content if isinstance(content, str) else ""
+
 
 
 

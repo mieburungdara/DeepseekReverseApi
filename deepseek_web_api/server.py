@@ -549,7 +549,7 @@ async def chat_completions(request: Request):
 
         await _throttle()
         try:
-            text, response_id = await client.chat_turn(
+            turn = await client.chat_turn(
                 prompt,
                 chat_session_id=chat_session_id,
                 parent_message_id=parent_message_id,
@@ -558,7 +558,8 @@ async def chat_completions(request: Request):
         except (DeepSeekWebError, Exception) as exc:  # noqa: BLE001
             return _error_response(exc)
 
-        _remember(response_id)
+        text = turn.text
+        _remember(turn.response_id)
         _mark_history_sent()
 
         content, tool_calls = tools_mod.parse_response(text, request_tools)
@@ -571,6 +572,11 @@ async def chat_completions(request: Request):
             # Pastikan content bukan null untuk jawaban biasa.
             message["content"] = content
             finish_reason = "stop"
+
+        # Model expert (deepseek-reasoner) menghasilkan proses berpikir.
+        # Ekspos sebagai reasoning_content, konvensi DeepSeek API resmi.
+        if turn.thinking:
+            message["reasoning_content"] = turn.thinking
 
         return JSONResponse(
             content={
@@ -605,17 +611,31 @@ async def chat_completions(request: Request):
         buffer: list[str] = []
         decided = False  # sudah dipastikan bukan tool call?
         HOLD_CHARS = 40  # cukup untuk melihat "do: {...}" atau awal DSML
+        want_thinking = bool(options.get("thinking_enabled"))
 
         try:
-            async for chunk in client.stream_turn(
+            async for kind, chunk in client.stream_turn(
                 prompt,
                 chat_session_id=chat_session_id,
                 parent_message_id=parent_message_id,
                 on_response_id=_remember,
+                include_thinking=want_thinking,
                 **options,
             ):
                 if not chunk:
                     continue
+
+                # Proses berpikir (model expert) dialirkan terpisah sebagai
+                # reasoning_content; tidak ikut buffer tool-call.
+                if kind == "thinking":
+                    yield _sse_chunk(
+                        completion_id,
+                        created,
+                        requested_model,
+                        {"reasoning_content": chunk},
+                    )
+                    continue
+
                 buffer.append(chunk)
 
                 if decided:

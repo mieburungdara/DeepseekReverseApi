@@ -434,6 +434,63 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 > terdeteksi, coba `deepseek-reasoner` (mode expert) atau perjelas deskripsi
 > tool-nya.
 
+## Reasoning / thinking (deepseek-reasoner)
+
+Model `deepseek-reasoner` memakai mode **expert** DeepSeek dan menghasilkan
+proses berpikir (fragmen `THINK`) sebelum jawaban. Gateway mengeksposnya
+sebagai **`reasoning_content`**, konvensi DeepSeek API resmi.
+
+| Model | `model_type` | Fragmen | `reasoning_content` |
+|---|---|---|---|
+| `deepseek-chat` | `default` | `RESPONSE` | kosong |
+| `deepseek-reasoner` | `expert` | `THINK`, `RESPONSE` | **terisi** |
+
+Non-streaming:
+
+```python
+r = client.chat.completions.create(
+    model="deepseek-reasoner",
+    messages=[{"role": "user", "content": "Hitung 17*23, tunjukkan langkah."}],
+)
+print(r.choices[0].message.reasoning_content)   # proses berpikir
+print(r.choices[0].message.content)             # jawaban akhir
+```
+
+Streaming — delta membawa `reasoning_content` lebih dulu, lalu `content`:
+
+```python
+for ch in client.chat.completions.create(
+    model="deepseek-reasoner", messages=[...], stream=True
+):
+    d = ch.choices[0].delta
+    if getattr(d, "reasoning_content", None):
+        print("[thinking]", d.reasoning_content)
+    elif d.content:
+        print(d.content, end="")
+```
+
+Lewat library:
+
+```python
+turn = await client.chat_turn("Hitung 17*23", chat_session_id=sid)
+print(turn.thinking)   # proses berpikir
+print(turn.text)       # jawaban
+print(turn.response_id)
+```
+
+Thinking bisa dimatikan walau memakai model expert:
+
+```python
+client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[...],
+    extra_body={"thinking_enabled": False},
+)
+```
+
+> Catatan: proses berpikir ditulis model dalam bahasa Inggris (internal),
+> sedangkan jawabannya mengikuti bahasa pengguna.
+
 ## Batasan yang diketahui
 
 - **PoW sekali pakai.** Setiap request chat butuh challenge baru (~0,11 s dengan
@@ -464,6 +521,7 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
 
 
 

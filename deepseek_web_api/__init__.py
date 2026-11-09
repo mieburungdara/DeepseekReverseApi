@@ -1,6 +1,6 @@
 """Reverse-engineered client for chat.deepseek.com."""
 
-from .client import DeepSeekWebClient
+from .client import DeepSeekWebClient, TurnResult
 from .http import (
     ApiError,
     AuthError,
@@ -25,6 +25,7 @@ __all__ = [
     "PowChallenge",
     "PowError",
     "TokenState",
+    "TurnResult",
     "solve",
     "solve_to_answer",
 ]
