@@ -15,6 +15,7 @@ Note the double nesting on login: the HTTP envelope's ``data`` holds a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -30,6 +31,7 @@ from .http import (
     AuthError,
     ChallengeRequiredError,
     DeepSeekWebError,
+    RateLimitError,
     NetworkError,
     TokenState,
     client_headers,
@@ -76,6 +78,9 @@ class DeepSeekWebClient:
         self.cookies = cookies or os.environ.get("DEEPSEEK_COOKIES")
         #: Backend PoW yang terakhir dipakai ("native" / "python").
         self.last_pow_backend: Optional[str] = None
+        #: Jeda minimum antar-pesan (detik) agar tidak kena rate limit.
+        self._min_interval = float(os.environ.get("DEEPSEEK_MIN_INTERVAL", "1.5"))
+        self._last_chat_at = 0.0
         self._http = client
         self._owns_http = client is None
 
@@ -311,6 +316,21 @@ class DeepSeekWebClient:
 
     # ------------------------------------------------------------------- chat
 
+    async def _throttle(self) -> None:
+        """Jaga jarak antar-request chat agar tidak kena ``rate_limit_reached``.
+
+        DeepSeek membalas "Messages too frequent. Try again later." bila dua
+        pesan dikirim terlalu rapat. Jeda ini berlaku per-instance client.
+        Atur lewat ``DEEPSEEK_MIN_INTERVAL`` (detik, 0 = matikan).
+        """
+        if self._min_interval <= 0:
+            return
+        now = time.monotonic()
+        wait = self._min_interval - (now - self._last_chat_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_chat_at = time.monotonic()
+
     async def stream_completion(
         self,
         prompt: str,
@@ -326,18 +346,25 @@ class DeepSeekWebClient:
 
         Each yielded dict has the shape ``{"event": str, "data": <parsed>}``.
         """
+        await self._throttle()
         if chat_session_id is None:
             chat_session_id = await self.create_session(model_type=model_type)
 
         body = {
             "chat_session_id": chat_session_id,
-            "parent_message_id": parent_message_id,
             "model_type": model_type,
             "prompt": prompt,
             "ref_file_ids": ref_file_ids or [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
         }
+
+        # PENTING: field "parent_message_id" harus DIHILANGKAN, bukan diisi
+        # null, untuk pesan pertama. DeepSeek membedakan keduanya: mengirim
+        # null membuat server membalas stream kosong (55 byte, tanpa error).
+        # Field ini hanya perlu diisi untuk menyambung pesan sebelumnya.
+        if parent_message_id is not None:
+            body["parent_message_id"] = parent_message_id
 
         client = await self._ensure_http()
         token = await self.ensure_token()
@@ -374,8 +401,33 @@ class DeepSeekWebClient:
                 text = raw.decode("utf-8", "replace")
                 raise self._explain_non_stream_error(text)
 
+            # Kumpulkan event sambil memeriksa apakah ada isi jawaban.
+            # Stream yang kosong total berarti rate limit, bukan jawaban kosong.
+            saw_content = False
+            rate_limit_msg: Optional[str] = None
             async for event in _iter_sse(response):
+                if event["event"] == "message":
+                    saw_content = True
+                elif event["event"] == "hint":
+                    hint = event["data"] or {}
+                    if (
+                        hint.get("finish_reason") == "rate_limit_reached"
+                        or hint.get("type") == "error"
+                    ):
+                        rate_limit_msg = hint.get("content") or rate_limit_msg
                 yield event
+
+            if not saw_content:
+                raise RateLimitError(
+                    "DeepSeek: "
+                    + (
+                        rate_limit_msg
+                        or "membalas tanpa isi jawaban (kemungkinan rate limit)"
+                    )
+                    + ". Tunggu sebentar sebelum mencoba lagi, atau naikkan "
+                    "DEEPSEEK_MIN_INTERVAL.",
+                    code=429,
+                )
 
     @staticmethod
     def _explain_non_stream_error(text: str) -> DeepSeekWebError:
@@ -418,6 +470,18 @@ class DeepSeekWebClient:
             code=code,
             payload=payload,
         )
+
+    @staticmethod
+    def _looks_rate_limited(raw: bytes) -> bool:
+        """Deteksi stream kosong akibat rate limit.
+
+        DeepSeek kadang membalas SSE yang nyaris kosong (beberapa ratus byte,
+        tanpa event ``message``) ketika IP/akun terlalu sering 요청. Ini bukan
+        error di sisi server, sehingga harus dikenali sendiri.
+        """
+        text = raw.decode("utf-8", "replace")
+        # Tidak ada event "message" sama sekali -> tidak ada isi jawaban.
+        return "event: message" not in text and '"type":"RESPONSE"' not in text
 
     async def chat(
         self,
@@ -623,4 +687,7 @@ def _extract_text(event: dict[str, Any]) -> str:
         return ""
     content = data.get("content") or data.get("text") or ""
     return content if isinstance(content, str) else ""
+
+
+
 

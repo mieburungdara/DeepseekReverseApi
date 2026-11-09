@@ -438,27 +438,33 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 
 - **PoW sekali pakai.** Setiap request chat butuh challenge baru (~0,11 s dengan
   solver native). Memakai ulang jawaban membuat server membalas stream kosong.
+- **Rate limit (`Messages too frequent`).** Bila pesan dikirim terlalu rapat,
+  DeepSeek membalas event `hint` berisi *"Messages too frequent. Try again
+  later."* lalu menutup stream tanpa jawaban. Gateway mengubahnya menjadi
+  **HTTP 429** dengan `Retry-After`, bukan "jawaban kosong".
+  Atur jeda antar-pesan dengan `DEEPSEEK_MIN_INTERVAL` (default 1,5 detik,
+  `0` = matikan).
 - **hCaptcha (40303 CHALLENGE_REQUIRED).** DeepSeek kadang meminta verifikasi
-  captcha. Gateway kini melaporkan ini sebagai error `429 challenge_required`
+  captcha. Gateway melaporkannya sebagai error `429 challenge_required`
   (bukan "jawaban kosong"). Selesaikan captcha di browser, lalu coba lagi.
 - **Tool calling berbasis prompt.** DeepSeek web tidak punya API tool resmi,
   jadi definisi tool disuntikkan ke prompt. Kepatuhan model tidak 100% — kalau
   tool call tak terdeteksi, coba `deepseek-reasoner` atau perjelas `description`.
+- **`parent_message_id` harus DIHILANGKAN, bukan `null`,** untuk pesan pertama.
+  Mengirim `null` membuat server membalas stream kosong (55 byte). Client sudah
+  menangani ini.
 - **`temperature`, `top_p`, `max_tokens` diabaikan.** UI web tidak mengirimkannya.
 - **AWS WAF** dapat memblokir (HTTP 202). Set `DEEPSEEK_COOKIES` dengan cookie
   browser (`aws-waf-token=...`) bila terjadi.
-- **Multi-turn** sudah ditangani: satu percakapan = satu sesi DeepSeek, dengan
-  `parent_message_id` dilacak otomatis. Lewat server OpenAI-compatible, mode
-  delta mengirim hanya pesan baru; riwayat penuh dikirim saat seed.
 - **Mode delta bergantung pada memori server.** Sesi percakapan disimpan in-memory
   (default 200 percakapan, TTL 6 jam). Restart server => seed ulang (aman,
-  otomatis). Sesi **di sisi DeepSeek** juga bisa hilang dari sisi mereka; kalau
-  begitu,set `DEEPSEEK_PROMPT_MODE=full` untuk selalu mengirim riwayat.
+  otomatis). Set `DEEPSEEK_PROMPT_MODE=full` untuk selalu mengirim riwayat.
 ## Struktur hasil reverse engineering
 
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
 
 
 

@@ -74,6 +74,15 @@ class ChallengeRequiredError(DeepSeekWebError):
     """
 
 
+class RateLimitError(DeepSeekWebError):
+    """Terlalu banyak pesan (``rate_limit_reached``).
+
+    Server DeepSeek mengirim event ``hint`` berisi
+    "Messages too frequent. Try again later." lalu menutup stream tanpa
+    jawaban. Dipisahkan agar gateway bisa membalas 429 + ``Retry-After``.
+    """
+
+
 def timezone_offset_seconds() -> int:
     """UTC offset in seconds, matching the browser's ``utcOffset() * 60``."""
     # ``time.timezone`` is seconds west of UTC, i.e. the sign is inverted.

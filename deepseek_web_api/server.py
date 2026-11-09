@@ -18,6 +18,7 @@ kemungkinan bentrok. Bisa juga diatur lewat env ``DEEPSEEK_PORT``.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -34,7 +35,13 @@ from . import auth as auth_mod
 from . import sessions as sessions_mod
 from . import tools as tools_mod
 from .client import DeepSeekWebClient
-from .http import ApiError, AuthError, ChallengeRequiredError, DeepSeekWebError
+from .http import (
+    ApiError,
+    AuthError,
+    ChallengeRequiredError,
+    DeepSeekWebError,
+    RateLimitError,
+)
 
 #: Port default: di luar rentang ephemeral (49152-65535), tidak dipakai layanan
 #: umum, dan tidak terdaftar di IANA untuk protokol apa pun.
@@ -374,6 +381,19 @@ def _completion_id() -> str:
 
 
 def _error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, RateLimitError):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                    "param": None,
+                }
+            },
+            headers={"Retry-After": "30"},
+        )
     if isinstance(exc, ChallengeRequiredError):
         return JSONResponse(
             status_code=429,
@@ -403,6 +423,29 @@ def _error_response(exc: Exception) -> JSONResponse:
             }
         },
     )
+
+
+#: Jeda minimum antar-request ke DeepSeek (detik). Mencegah rate limit.
+MIN_REQUEST_INTERVAL = float(os.environ.get("DEEPSEEK_MIN_INTERVAL", "1.5"))
+
+#: Waktu request terakhir ke DeepSeek (monotonic), per proses.
+_last_request_at = 0.0
+
+
+async def _throttle() -> None:
+    """Tunggu agar jarak antar-request ke DeepSeek cukup jauh.
+
+    Tanpa jeda, beberapa request beruntun memicu rate limit dari DeepSeek
+    (respons SSE kosong tanpa error).
+    """
+    global _last_request_at
+    if MIN_REQUEST_INTERVAL <= 0:
+        return
+    now = time.monotonic()
+    wait = MIN_REQUEST_INTERVAL - (now - _last_request_at)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_request_at = time.monotonic()
 
 
 # ----------------------------------------------------------------- completion
@@ -503,6 +546,8 @@ async def chat_completions(request: Request):
         sessions_mod.STORE.mark_sent(conv_key, messages, delta=use_delta)
 
     if not body.get("stream", False):
+
+        await _throttle()
         try:
             text, response_id = await client.chat_turn(
                 prompt,
@@ -549,6 +594,8 @@ async def chat_completions(request: Request):
         )
 
     async def event_stream() -> AsyncIterator[bytes]:
+
+        await _throttle()
         yield _sse_chunk(completion_id, created, requested_model, {"role": "assistant"})
 
         # Model web mengirim potongan sangat kecil (kadang satu karakter), jadi
@@ -1097,5 +1144,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
 
 

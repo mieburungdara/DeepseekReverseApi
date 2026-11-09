@@ -34,14 +34,26 @@ TOOLS = [
 ]
 
 
-def post(body, key="sk-uji"):
+def post(body, key="sk-uji", retries: int = 5, wait: int = 25):
+    """POST ke gateway, dengan retry saat kena 429 (rate limit DeepSeek)."""
     req = urllib.request.Request(
         BASE + "/v1/chat/completions",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
         method="POST",
     )
-    return urllib.request.urlopen(req, timeout=180)
+    last = None
+    for attempt in range(retries):
+        try:
+            return urllib.request.urlopen(req, timeout=180)
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            last = e
+            print(f"  [429 rate limit, tunggu {wait}s lalu coba lagi "
+                  f"({attempt + 1}/{retries})]")
+            time.sleep(wait)
+    raise last  # type: ignore[misc]
 
 
 def main() -> int:

@@ -7,6 +7,7 @@ from .http import (
     ChallengeRequiredError,
     DeepSeekWebError,
     NetworkError,
+    RateLimitError,
     TokenState,
 )
 from .pow import ALGORITHM, PowAnswer, PowChallenge, PowError, solve, solve_to_answer
@@ -19,6 +20,7 @@ __all__ = [
     "DeepSeekWebClient",
     "DeepSeekWebError",
     "NetworkError",
+    "RateLimitError",
     "PowAnswer",
     "PowChallenge",
     "PowError",
@@ -28,3 +30,4 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
+
