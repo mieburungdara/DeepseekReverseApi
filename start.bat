@@ -54,6 +54,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- Cookie browser (wajib untuk melewati AWS WAF) --------------------
+REM Endpoint create_pow_challenge diblokir WAF (HTTP 202) tanpa cookie
+REM browser yang valid. Cookie diambil dari DevTools > Application >
+REM Cookies > https://chat.deepseek.com (atau Local Storage).
+REM Client membaca cookie.txt secara otomatis, jadi di sini cukup dicek
+REM keberadaannya. Env DEEPSEEK_COOKIES (kalau diset) mengungguli file ini.
+if exist "cookie.txt" (
+    echo [OK] cookie.txt ada - client akan memuatnya otomatis.
+) else (
+    echo [PERINGATAN] cookie.txt tidak ada.
+    echo   Tanpa cookie, endpoint PoW diblokir AWS WAF ^(HTTP 202^).
+    echo   Ambil cookie dari browser: DevTools ^> Application ^>
+    echo   Cookies ^> https://chat.deepseek.com, lalu simpan ke cookie.txt.
+)
+
 REM --- Validasi token ---------------------------------------------------
 set "TOKEN_OK="
 if exist "token.json" set "TOKEN_OK=1"

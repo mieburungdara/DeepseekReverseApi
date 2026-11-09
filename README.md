@@ -499,7 +499,7 @@ client.chat.completions.create(
   DeepSeek membalas event `hint` berisi *"Messages too frequent. Try again
   later."* lalu menutup stream tanpa jawaban. Gateway mengubahnya menjadi
   **HTTP 429** dengan `Retry-After`, bukan "jawaban kosong".
-  Atur jeda antar-pesan dengan `DEEPSEEK_MIN_INTERVAL` (default 1,5 detik,
+  Atur jeda antar-pesan dengan `DEEPSEEK_MIN_INTERVAL` (default 2 detik,
   `0` = matikan).
 - **hCaptcha (40303 CHALLENGE_REQUIRED).** DeepSeek kadang meminta verifikasi
   captcha. Gateway melaporkannya sebagai error `429 challenge_required`

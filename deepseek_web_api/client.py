@@ -39,6 +39,7 @@ from .http import (
     make_client,
     unwrap_envelope,
 )
+from .config import min_interval
 from .pow import PowChallenge, PowError, solve_to_answer
 from .stream import DeltaAccumulator
 
@@ -58,6 +59,40 @@ class TurnResult:
     text: str
     thinking: str
     response_id: str
+
+
+def _default_cookies(explicit: Optional[str] = None) -> Optional[str]:
+    """Tentukan cookie browser yang dipakai.
+
+    Urutan:
+      1. argumen ``cookies``
+      2. env ``DEEPSEEK_COOKIES``
+      3. file ``cookie.txt`` di folder proyek (dibuat manual dari browser)
+
+    Tanpa cookie, endpoint ``create_pow_challenge`` diblokir AWS WAF dengan
+    HTTP 202 - tidak ada error lain yang sampai ke pengguna.
+    """
+    if explicit:
+        return explicit.strip() or None
+
+    env = os.environ.get("DEEPSEEK_COOKIES")
+    if env and env.strip():
+        return env.strip()
+
+    # File cookie.txt di folder proyek atau di cwd.
+    candidates = [
+        os.path.join(os.getcwd(), "cookie.txt"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookie.txt"),
+    ]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read().strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    return None
 
 
 class DeepSeekWebClient:
@@ -85,11 +120,11 @@ class DeepSeekWebClient:
         self.device_id = device_id or uuid.uuid4().hex
         self.token_file = token_file
         #: Cookie mentah dari browser, mis. "aws-waf-token=...; ds_session_id=..."
-        self.cookies = cookies or os.environ.get("DEEPSEEK_COOKIES")
+        self.cookies = _default_cookies(cookies)
         #: Backend PoW yang terakhir dipakai ("native" / "python").
         self.last_pow_backend: Optional[str] = None
         #: Jeda minimum antar-pesan (detik) agar tidak kena rate limit.
-        self._min_interval = float(os.environ.get("DEEPSEEK_MIN_INTERVAL", "1.5"))
+        self._min_interval = min_interval()
         self._last_chat_at = 0.0
         self._http = client
         self._owns_http = client is None
@@ -256,9 +291,16 @@ class DeepSeekWebClient:
     def _parse_json(response: httpx.Response, *, context: str) -> Any:
         if response.status_code == 202:
             # AWS WAF interstitial; the API itself answers 200.
+            #
+            # Penyebab paling umum: cookie browser (aws-waf-token) hilang atau
+            # kedaluwarsa. Pesannya dibuat eksplisit karena tanpa ini pengguna
+            # hanya melihat "coba lagi" tanpa tahu apa yang harus diperbaiki.
             raise NetworkError(
-                f"{context}: blocked by AWS WAF (HTTP 202 challenge). "
-                "Try again, or reuse a browser session's cookies.",
+                f"{context}: diblokir AWS WAF (HTTP 202 challenge). "
+                "Cookie browser diperlukan: simpan cookie 'aws-waf-token' dari "
+                "chat.deepseek.com (DevTools > Application > Cookies) ke file "
+                "'cookie.txt' di folder proyek, atau set env DEEPSEEK_COOKIES. "
+                "Kalau cookie sudah ada, kemungkinan kedaluwarsa - ambil ulang.",
                 payload=response.text[:300],
             )
         if response.status_code >= 500:
@@ -333,10 +375,11 @@ class DeepSeekWebClient:
         pesan dikirim terlalu rapat. Jeda ini berlaku per-instance client.
         Atur lewat ``DEEPSEEK_MIN_INTERVAL`` (detik, 0 = matikan).
         """
-        if self._min_interval <= 0:
+        interval = self._min_interval if self._min_interval else min_interval()
+        if interval <= 0:
             return
         now = time.monotonic()
-        wait = self._min_interval - (now - self._last_chat_at)
+        wait = interval - (now - self._last_chat_at)
         if wait > 0:
             await asyncio.sleep(wait)
         self._last_chat_at = time.monotonic()

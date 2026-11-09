@@ -35,6 +35,7 @@ from . import auth as auth_mod
 from . import sessions as sessions_mod
 from . import tools as tools_mod
 from .client import DeepSeekWebClient
+from .config import min_interval
 from .http import (
     ApiError,
     AuthError,
@@ -426,7 +427,8 @@ def _error_response(exc: Exception) -> JSONResponse:
 
 
 #: Jeda minimum antar-request ke DeepSeek (detik). Mencegah rate limit.
-MIN_REQUEST_INTERVAL = float(os.environ.get("DEEPSEEK_MIN_INTERVAL", "1.5"))
+#: Nilai dibaca dari ``config.min_interval()`` (single source of truth).
+MIN_REQUEST_INTERVAL = min_interval()
 
 #: Waktu request terakhir ke DeepSeek (monotonic), per proses.
 _last_request_at = 0.0
@@ -439,10 +441,11 @@ async def _throttle() -> None:
     (respons SSE kosong tanpa error).
     """
     global _last_request_at
-    if MIN_REQUEST_INTERVAL <= 0:
+    interval = min_interval()
+    if interval <= 0:
         return
     now = time.monotonic()
-    wait = MIN_REQUEST_INTERVAL - (now - _last_request_at)
+    wait = interval - (now - _last_request_at)
     if wait > 0:
         await asyncio.sleep(wait)
     _last_request_at = time.monotonic()

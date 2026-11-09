@@ -29,6 +29,15 @@ if exist "token.json" (
     exit /b 1
 )
 
+if exist "cookie.txt" (
+    echo Cookie browser dimuat dari cookie.txt
+) else (
+    echo [PERINGATAN] cookie.txt tidak ada.
+    echo   Tanpa cookie, endpoint PoW diblokir AWS WAF ^(HTTP 202^).
+    echo   Ambil cookie dari browser dan simpan: set-cookie.bat
+    echo.
+)
+
 echo Menjalankan probe: solver PoW, auth, dan streaming chat ...
 echo.
 "%PY%" -m tests.live_probe

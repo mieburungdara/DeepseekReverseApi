@@ -90,6 +90,17 @@ async def probe_with_token(token: str | None = None, token_file: str | None = No
 async def main() -> int:
     """Return 0 hanya bila alur terautentikasi benar-benar berhasil."""
     await probe_pow_solver_offline()
+
+    # Cek cookie browser: tanpa ini endpoint PoW diblokir AWS WAF.
+    from deepseek_web_api.client import _default_cookies
+
+    cookies = _default_cookies()
+    if cookies:
+        print(f"   cookie browser: ada ({len(cookies)} char)")
+    else:
+        print("   cookie browser: TIDAK ADA - endpoint PoW akan diblokir WAF")
+        print("   -> jalankan set-cookie.bat")
+
     await probe_unauthenticated()
 
     token = os.environ.get("DEEPSEEK_TOKEN")
