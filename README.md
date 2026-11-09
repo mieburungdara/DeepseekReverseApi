@@ -26,6 +26,7 @@ dibutuhkan setiap request chat.
 | `deepseek_web_api/stream.py` | Parser delta SSE (stateful JSON-Patch) |
 | `deepseek_web_api/dsml.py` | Parser tool-call DSML bawaan DeepSeek |
 | `deepseek_web_api/tools.py` | Jembatan tool calling → format OpenAI |
+| `deepseek_web_api/sessions.py` | Pemetaan percakapan → satu sesi DeepSeek |
 | `deepseek_web_api/client.py` | Client async: login, PoW, chat, multi-turn |
 | `deepseek_web_api/server.py` | Server OpenAI-compatible |
 | `native/deepseek_pow.c` | Solver C (~1,3 juta hash/detik) |
@@ -291,6 +292,47 @@ python -m tests.test_offline     # tanpa jaringan, 20 assertion
 python -m tests.live_probe       # ke server asli; butuh DEEPSEEK_TOKEN
 ```
 
+## Sesi percakapan
+
+Satu percakapan klien memakai **satu** `chat_session_id` DeepSeek. Sebelumnya
+setiap request membuat sesi baru, sehingga riwayat menumpuk di server DeepSeek
+dan model kehilangan konteks antar giliran.
+
+Penentuan percakapan, berurutan:
+
+1. Header **`X-Conversation-Id`** (atau `X-Session-Id`) — paling andal.
+2. Field **`user`** pada body (konvensi OpenAI).
+3. **Sidik jari** dari pesan sistem + pesan pengguna pertama.
+
+`parent_message_id` juga dilacak otomatis: id pesan asisten terakhir dikirim
+sebagai induk pada giliran berikutnya, sehingga server DeepSeek menyambung
+percakapan.
+
+```python
+# klien yang sama -> sesi yang sama
+client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "Nama saya Budi."}],
+    extra_headers={"X-Conversation-Id": "chat-123"},
+)
+client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "Siapa nama saya?"}],
+    extra_headers={"X-Conversation-Id": "chat-123"},
+)
+# -> "Nama Anda Budi!"
+```
+
+Periksa dan bersihkan pemetaan sesi:
+
+```bash
+curl -H "Authorization: Bearer x" http://127.0.0.1:17395/v1/sessions
+curl -X DELETE -H "Authorization: Bearer x" http://127.0.0.1:17395/v1/sessions
+```
+
+Pemetaan disimpan di memori (default maksimum 200 percakapan, kedaluwarsa
+setelah 6 jam). Menghapusnya **tidak** menghapus riwayat di akun DeepSeek Anda.
+
 ## Tool calling (function calling)
 
 DeepSeek web tidak punya API tool resmi, jadi gateway ini menjembatani:
@@ -350,6 +392,7 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
 
 
 

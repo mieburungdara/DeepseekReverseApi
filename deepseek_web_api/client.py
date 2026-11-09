@@ -427,6 +427,72 @@ class DeepSeekWebClient:
             response_id = str(mid) if mid is not None else ""
         return accumulator.answer_text(), response_id
 
+    async def stream_turn(
+        self,
+        prompt: str,
+        *,
+        chat_session_id: str,
+        parent_message_id: Optional[str | int] = None,
+        on_response_id: Optional[Any] = None,
+        include_thinking: bool = False,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """Streaming satu giliran, sekaligus melaporkan ``response_message_id``.
+
+        ``on_response_id`` dipanggil sekali dengan id pesan asisten begitu
+        event ``ready`` diterima, supaya pemanggil bisa menyimpannya sebagai
+        ``parent_message_id`` untuk giliran berikutnya.
+        """
+        accumulator = DeltaAccumulator()
+        emitted_answer = 0
+        emitted_think = 0
+        reported = False
+
+        parent: Optional[int] = None
+        if parent_message_id not in (None, "", "null"):
+            try:
+                parent = int(parent_message_id)
+            except (TypeError, ValueError):
+                parent = None
+
+        async for event in self.stream_completion(
+            prompt,
+            chat_session_id=chat_session_id,
+            parent_message_id=parent,
+            **kwargs,
+        ):
+            name = event["event"]
+
+            if name == "ready":
+                data = event["data"] or {}
+                rid = data.get("response_message_id")
+                if rid is not None and not reported and on_response_id is not None:
+                    on_response_id(rid)
+                    reported = True
+                continue
+
+            if name != "message":
+                continue
+
+            accumulator.apply_event(event["data"])
+
+            if include_thinking:
+                think = accumulator.thinking_text()
+                if len(think) > emitted_think:
+                    yield think[emitted_think:]
+                    emitted_think = len(think)
+
+            answer = accumulator.answer_text()
+            if len(answer) > emitted_answer:
+                yield answer[emitted_answer:]
+                emitted_answer = len(answer)
+
+        # Bila "ready" tidak pernah datang, ambil id dari objek respons.
+        if not reported and on_response_id is not None:
+            mid = accumulator.response.get("message_id")
+            if mid is not None:
+                on_response_id(mid)
+
     async def stream_text(
         self,
         prompt: str,

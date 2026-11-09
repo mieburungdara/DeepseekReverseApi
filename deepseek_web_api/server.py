@@ -30,6 +30,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import auth as auth_mod
+from . import sessions as sessions_mod
 from . import tools as tools_mod
 from .client import DeepSeekWebClient
 from .http import ApiError, AuthError, DeepSeekWebError
@@ -318,11 +319,46 @@ async def chat_completions(request: Request):
     created = int(time.time())
     requested_model = body.get("model") or DEFAULT_MODEL
 
+    # --- Sesi percakapan ---------------------------------------------------
+    # Satu percakapan klien = satu chat_session_id DeepSeek. Tanpa ini setiap
+    # request membuat sesi baru: riwayat menumpuk di server DeepSeek dan model
+    # kehilangan konteks antar giliran.
+    conv_key = sessions_mod.conversation_key(body, dict(request.headers))
+    conv = sessions_mod.STORE.get(conv_key)
+
+    if conv is not None and conv.chat_session_id:
+        chat_session_id = conv.chat_session_id
+        parent_message_id = conv.parent_message_id
+    else:
+        try:
+            chat_session_id = await client.create_session(model_type=model_type)
+        except Exception as exc:  # noqa: BLE001
+            return _error_response(exc)
+        parent_message_id = None
+        conv = sessions_mod.STORE.put(
+            conv_key, chat_session_id, parent_message_id=None, model_type=model_type
+        )
+
+    def _remember(response_id: Any) -> None:
+        """Simpan id pesan asisten untuk dipakai sebagai induk berikutnya."""
+        try:
+            pid = int(response_id)
+        except (TypeError, ValueError):
+            return
+        sessions_mod.STORE.touch(conv_key, parent_message_id=pid)
+
     if not body.get("stream", False):
         try:
-            text = await client.chat(prompt, **options)
+            text, response_id = await client.chat_turn(
+                prompt,
+                chat_session_id=chat_session_id,
+                parent_message_id=parent_message_id,
+                **options,
+            )
         except (DeepSeekWebError, Exception) as exc:  # noqa: BLE001
             return _error_response(exc)
+
+        _remember(response_id)
 
         content, tool_calls = tools_mod.parse_response(text, request_tools)
 
@@ -368,7 +404,13 @@ async def chat_completions(request: Request):
         HOLD_CHARS = 40  # cukup untuk melihat "do: {...}" atau awal DSML
 
         try:
-            async for chunk in client.stream_text(prompt, **options):
+            async for chunk in client.stream_turn(
+                prompt,
+                chat_session_id=chat_session_id,
+                parent_message_id=parent_message_id,
+                on_response_id=_remember,
+                **options,
+            ):
                 if not chunk:
                     continue
                 buffer.append(chunk)
@@ -527,6 +569,25 @@ def _sse_error(completion_id: str, created: int, model: str, message: str) -> by
         ],
     }
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+@app.get("/v1/sessions")
+async def list_sessions(request: Request) -> Any:
+    """Lihat percakapan aktif dan sesi DeepSeek yang dipakainya."""
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+    return sessions_mod.STORE.stats()
+
+
+@app.delete("/v1/sessions")
+async def clear_sessions(request: Request) -> Any:
+    """Lupakan semua pemetaan percakapan (bukan menghapus di server DeepSeek)."""
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+    sessions_mod.STORE.clear()
+    return {"ok": True, "message": "Semua pemetaan percakapan dibersihkan."}
 
 
 @app.get("/healthz")
