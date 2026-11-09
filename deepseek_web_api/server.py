@@ -387,6 +387,64 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _pid_alive(pid: int) -> bool:
+    """Cek apakah proses ``pid`` masih hidup, secara portabel.
+
+    Di Windows **jangan** pakai ``os.kill(pid, 0)``: implementasinya memanggil
+    ``TerminateProcess`` dengan handle akses yang salah sehingga melempar
+    ``OSError [WinError 87]`` ("The parameter is incorrect") untuk proses yang
+    justru masih hidup. Cara yang benar adalah membuka handle dengan
+    ``PROCESS_QUERY_LIMITED_INFORMATION`` lalu membaca exit code.
+    """
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            ERROR_ACCESS_DENIED = 5
+
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.GetLastError.restype = wintypes.DWORD
+
+            handle = k32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                # Bedakan "tidak ada" dari "ada tapi tidak boleh dibuka".
+                # Access-denied berarti proses ADA (mis. proses sistem), jadi
+                # jangan sampai kita mematikan diri sendiri karena itu.
+                if k32.GetLastError() == ERROR_ACCESS_DENIED:
+                    return True
+                return False
+            try:
+                code = wintypes.DWORD()
+                ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+                if not ok:
+                    return True  # tidak bisa dipastikan -> anggap hidup
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - jangan pernah mematikan diri karena error cek
+            return True  # anggap hidup: lebih aman daripada mematikan diri salah
+
+    # POSIX
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # ada, tapi bukan milik kita
+    except OSError:
+        return False
+    return True
+
+
 def _watch_parent(parent_pid: int, interval: float = 3.0) -> None:
     """Hentikan proses bila induknya hilang (jendela terminal ditutup paksa).
 
@@ -398,13 +456,16 @@ def _watch_parent(parent_pid: int, interval: float = 3.0) -> None:
     import threading
 
     def _loop() -> None:
+        # Beri waktu singkat agar induk sempat stabil.
+        time.sleep(interval)
         while True:
-            time.sleep(interval)
             try:
-                os.kill(parent_pid, 0)  # sinyal 0 = cek keberadaan proses
-            except OSError:
-                # Induk sudah tidak ada -> matikan diri sendiri.
-                os._exit(0)
+                if not _pid_alive(parent_pid):
+                    os._exit(0)
+            except Exception:  # noqa: BLE001
+                # Jangan biarkan thread mati; coba lagi pada siklus berikutnya.
+                pass
+            time.sleep(interval)
 
     thread = threading.Thread(target=_loop, name="parent-watchdog", daemon=True)
     thread.start()
