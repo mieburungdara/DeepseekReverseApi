@@ -29,6 +29,7 @@ from typing import Any, AsyncIterator, Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import auth as auth_mod
 from .client import DeepSeekWebClient
 from .http import ApiError, AuthError, DeepSeekWebError
 
@@ -96,11 +97,39 @@ def get_client() -> DeepSeekWebClient:
     return _client
 
 
+def _auth_error(message: str) -> JSONResponse:
+    """Respons 401 bergaya OpenAI, supaya SDK/agen menampilkan pesan yang jelas."""
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+                "param": None,
+            }
+        },
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _require_auth(request: Request) -> Optional[JSONResponse]:
+    """Return None bila lolos, atau respons 401 bila ditolak."""
+    result = auth_mod.check(dict(request.headers))
+    if result.ok:
+        return None
+    return _auth_error(result.error or "Unauthorized")
+
+
 # --------------------------------------------------------------------- models
 
 
 @app.get("/v1/models")
-async def list_models() -> dict[str, Any]:
+async def list_models(request: Request) -> Any:
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+
     now = int(time.time())
     return {
         "object": "list",
@@ -113,6 +142,33 @@ async def list_models() -> dict[str, Any]:
             }
             for name in ("deepseek-chat", "deepseek-reasoner", "deepseek-vision")
         ],
+    }
+
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str, request: Request) -> Any:
+    """Sebagian agen memanggil endpoint ini untuk memeriksa satu model."""
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+
+    if model_id not in MODEL_MAP:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"Model '{model_id}' tidak ditemukan.",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                    "param": None,
+                }
+            },
+        )
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "deepseek-web",
     }
 
 
@@ -209,11 +265,12 @@ def _error_response(exc: Exception) -> JSONResponse:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-):
+async def chat_completions(request: Request):
     """Accept an OpenAI chat completion request and proxy it to DeepSeek web."""
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+
     try:
         body = await request.json()
     except json.JSONDecodeError:
@@ -330,6 +387,44 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/v1/auth/check")
+async def auth_check(request: Request) -> Any:
+    """Cek apakah key yang dikirim diterima gateway ini.
+
+    Berguna untuk tombol "Test connection" di agen AI: membalas 200 + detail
+    mode bila key valid, atau 401 bila tidak.
+    """
+    denied = _require_auth(request)
+    if denied is not None:
+        return denied
+    return {
+        "ok": True,
+        "mode": auth_mod.current_mode(),
+        "description": auth_mod.describe(),
+        "key_received": bool(auth_mod.extract_key(dict(request.headers))),
+    }
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    """Landing page sederhana agar mudah diperiksa dari browser."""
+    return {
+        "service": "DeepSeek Web -> OpenAI compatible API",
+        "auth_mode": auth_mod.describe(),
+        "base_url": "/v1",
+        "endpoints": [
+            "GET  /v1/models",
+            "GET  /v1/models/{model}",
+            "POST /v1/chat/completions",
+            "GET  /v1/auth/check",
+            "GET  /healthz",
+        ],
+        "note": (
+            "Isi API key dengan string apa pun pada mode open/any."
+        ),
+    }
+
+
 def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
     """True bila ``port`` bisa di-bind sekarang."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -402,7 +497,28 @@ def main() -> None:
         help="cari port bebas berikutnya bila port yang diminta sedang dipakai",
     )
     parser.add_argument("--reload", action="store_true", help="auto-reload (mode dev)")
+    parser.add_argument(
+        "--auth",
+        choices=list(auth_mod.MODES),
+        default=None,
+        help=(
+            "mode API key: open (key apa pun / tanpa key), any (key apa pun "
+            "tapi wajib diisi), strict (harus sama dengan DEEPSEEK_API_KEY). "
+            "Default: env DEEPSEEK_AUTH_MODE atau 'open'."
+        ),
+    )
     args = parser.parse_args()
+
+    # Flag CLI menimpa env.
+    if args.auth:
+        os.environ["DEEPSEEK_AUTH_MODE"] = args.auth
+    if auth_mod.current_mode() == "strict" and not auth_mod.expected_key():
+        print(
+            "ERROR: mode 'strict' butuh DEEPSEEK_API_KEY.\n"
+            "  Contoh: set DEEPSEEK_API_KEY=sk-rahasia-saya",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     requested = args.port
     if requested is None:
@@ -437,6 +553,9 @@ def main() -> None:
     print(f"DeepSeek Web API siap di http://{args.host}:{_describe_port(port)}")
     print(f"  OpenAI base_url : http://{args.host}:{port}/v1")
     print(f"  Model tersedia  : {', '.join(MODEL_MAP)}")
+    print(f"  Mode API key    : {auth_mod.describe()}")
+    if auth_mod.current_mode() == "open":
+        print("  -> Isi kolom API key di agen dengan string APA SAJA (mis. 'sk-lokal').")
 
     uvicorn.run(
         "deepseek_web_api.server:app",

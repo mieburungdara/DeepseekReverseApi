@@ -58,14 +58,33 @@ set "PORTARG="
 if /I "%~1"=="auto" (
     set "PORTARG=--auto-port"
     echo [OK] Mode auto-port: akan mencari port bebas.
+) else if /I "%~1"=="any" (
+    set "PORTARG=--auth any"
+    echo [OK] Mode API key: any ^(key wajib, isi bebas^)
+) else if /I "%~1"=="strict" (
+    set "PORTARG=--auth strict"
+    echo [OK] Mode API key: strict ^(harus sama dengan DEEPSEEK_API_KEY^)
 ) else if not "%~1"=="" (
     set "PORTARG=--port %~1"
     echo [OK] Memakai port %~1
 ) else (
     echo [OK] Memakai port default 17395
+    echo [OK] Mode API key: open ^(isi kolom API key dengan string APA SAJA^)
 )
 echo.
 
+echo ============================================================
+echo   PENTING - kolom API key di agen AI
+echo ============================================================
+echo.
+echo   Banyak agen ^(Open WebUI, LobeChat, Cursor, dll.^) mewajibkan
+echo   API key diisi. Pada mode default, isi dengan string APA SAJA:
+echo.
+echo     sk-lokal        atau    123        atau    bebas
+echo.
+echo   Base URL  : http://127.0.0.1:17395/v1
+echo   Model     : deepseek-chat  /  deepseek-reasoner
+echo.
 echo ============================================================
 echo   Server berjalan. Tekan CTRL+C untuk menghentikan.
 echo ============================================================

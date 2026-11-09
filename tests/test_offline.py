@@ -271,12 +271,76 @@ def test_token_parsing() -> None:
         os.unlink(path)
 
 
+def test_auth() -> None:
+    print("\n[API key auth]")
+    from deepseek_web_api import auth
+
+    def check_with(mode: str, headers: dict, expected_key: str | None = None):
+        old_mode = os.environ.get("DEEPSEEK_AUTH_MODE")
+        old_key = os.environ.get("DEEPSEEK_API_KEY")
+        os.environ["DEEPSEEK_AUTH_MODE"] = mode
+        if expected_key is None:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+        else:
+            os.environ["DEEPSEEK_API_KEY"] = expected_key
+        try:
+            return auth.check(headers)
+        finally:
+            if old_mode is None:
+                os.environ.pop("DEEPSEEK_AUTH_MODE", None)
+            else:
+                os.environ["DEEPSEEK_AUTH_MODE"] = old_mode
+            if old_key is None:
+                os.environ.pop("DEEPSEEK_API_KEY", None)
+            else:
+                os.environ["DEEPSEEK_API_KEY"] = old_key
+
+    # extract_key: berbagai header
+    check("extract Bearer", auth.extract_key({"authorization": "Bearer abc"}) == "abc")
+    check("extract raw", auth.extract_key({"authorization": "abc"}) == "abc")
+    check("extract x-api-key", auth.extract_key({"x-api-key": "abc"}) == "abc")
+    check("extract api-key", auth.extract_key({"api-key": "abc"}) == "abc")
+    check("extract kosong", auth.extract_key({"authorization": "Bearer "}) is None)
+    check("extract tanpa header", auth.extract_key({}) is None)
+
+    # mode open: apa pun lolos
+    check("open tanpa key", check_with("open", {}).ok)
+    check("open key acak", check_with("open", {"authorization": "Bearer apa-saja"}).ok)
+    check("open key aneh", check_with("open", {"x-api-key": "123!@#"}).ok)
+
+    # mode any: wajib ada key, isi bebas
+    check("any tanpa key ditolak", not check_with("any", {}).ok)
+    check("any key apa pun lolos", check_with("any", {"authorization": "Bearer x"}).ok)
+
+    # mode strict
+    check(
+        "strict key benar",
+        check_with("strict", {"authorization": "Bearer rahasia"}, "rahasia").ok,
+    )
+    check(
+        "strict key salah",
+        not check_with("strict", {"authorization": "Bearer salah"}, "rahasia").ok,
+    )
+    check(
+        "strict tanpa key",
+        not check_with("strict", {}, "rahasia").ok,
+    )
+    check(
+        "strict tanpa DEEPSEEK_API_KEY ditolak",
+        not check_with("strict", {"authorization": "Bearer apa"}, None).ok,
+    )
+
+    # mode tak dikenal jatuh ke open
+    check("mode tak dikenal -> open", check_with("ngawur", {}).ok)
+
+
 def main() -> int:
     test_pow()
     test_delta()
     test_server_shaping()
     test_server_port()
     test_token_parsing()
+    test_auth()
     print("\n" + "=" * 60)
     if failures:
         print(f"FAILED: {len(failures)} -> {failures}")

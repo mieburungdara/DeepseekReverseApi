@@ -189,6 +189,42 @@ $env:DEEPSEEK_TOKEN_FILE="token.json"
 python -m deepseek_web_api.server            # http://127.0.0.1:17395
 ```
 
+### API key
+
+Banyak agen AI (Open WebUI, LobeChat, Cursor, Continue, dll.) **mewajibkan**
+kolom API key diisi. Gateway ini punya tiga mode:
+
+| Mode | Perilaku | Kapan dipakai |
+|---|---|---|
+| `open` *(default)* | Key **apa pun** diterima, bahkan tanpa key | Uji coba lokal |
+| `any` | Key apa pun diterima **asalkan tidak kosong** | Ingin agen tetap "login" |
+| `strict` | Harus sama dengan `DEEPSEEK_API_KEY` | Server diekspos ke jaringan |
+
+**Jadi pada mode default, isi kolom API key dengan string apa saja** — misal
+`sk-lokal`, `123`, atau `bebas`. Semua berhasil.
+
+```bat
+python -m deepseek_web_api.server                        :: mode open
+python -m deepseek_web_api.server --auth any             :: wajib ada key
+python -m deepseek_web_api.server --auth strict          :: butuh DEEPSEEK_API_KEY
+```
+
+Untuk mode `strict`:
+
+```powershell
+$env:DEEPSEEK_API_KEY="sk-rahasia-saya"
+python -m deepseek_web_api.server --auth strict
+```
+
+Header yang dikenali: `Authorization: Bearer <key>`, `Authorization: <key>`,
+`x-api-key: <key>`, `api-key: <key>`.
+
+Cek cepat apakah key Anda diterima:
+
+```bash
+curl -H "Authorization: Bearer apa-saja" http://127.0.0.1:17395/v1/auth/check
+```
+
 Opsi port:
 
 ```bash
@@ -197,29 +233,21 @@ python -m deepseek_web_api.server --auto-port    # geser otomatis bila bentrok
 $env:DEEPSEEK_PORT="18500"                       # lewat environment
 ```
 
-Bila port sudah dipakai tanpa `--auto-port`, server berhenti dengan pesan yang
-menyarankan port bebas berikutnya.
-
 Lalu arahkan SDK OpenAI biasa ke server lokal:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:17395/v1", api_key="tidak-dipakai")
+client = OpenAI(
+    base_url="http://127.0.0.1:17395/v1",
+    api_key="sk-lokal",          # string apa pun, mode open
+)
 
 resp = client.chat.completions.create(
     model="deepseek-chat",
     messages=[{"role": "user", "content": "Halo!"}],
 )
 print(resp.choices[0].message.content)
-
-# streaming
-for chunk in client.chat.completions.create(
-    model="deepseek-reasoner",
-    messages=[{"role": "user", "content": "Hitung 17*23"}],
-    stream=True,
-):
-    print(chunk.choices[0].delta.content or "", end="")
 ```
 
 Pemetaan model:
