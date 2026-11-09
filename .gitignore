@@ -1,0 +1,22 @@
+# Token & kredensial - JANGAN pernah di-commit
+token.json
+cookie.txt
+*.token
+.env
+.env.*
+
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Artefak reverse engineering (bundle JS mentah, ~3 MB)
+_re/
+
+# Log
+*.log
