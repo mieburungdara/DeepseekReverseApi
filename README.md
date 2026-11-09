@@ -17,6 +17,7 @@ dibutuhkan setiap request chat.
 | `set-token.bat` | **Simpan token ke `token.json`** |
 | `login.bat` | Login otomatis (email/password) |
 | `start.bat` | Jalankan server (port bisa diatur) |
+| `stop.bat` | **Hentikan server & bersihkan proses sisa** |
 | `test.bat` | Uji koneksi ke DeepSeek |
 | `build.bat` | Kompilasi ulang solver native (opsional) |
 | `token.json` | **Token Anda** (dibuat sendiri, tidak di-commit) |
@@ -232,6 +233,24 @@ python -m deepseek_web_api.server --port 19999   # port lain
 python -m deepseek_web_api.server --auto-port    # geser otomatis bila bentrok
 $env:DEEPSEEK_PORT="18500"                       # lewat environment
 ```
+
+### Menghentikan server & membersihkan proses sisa
+
+```bat
+stop.bat
+```
+
+`start.bat` menjalankan Python **langsung** — satu proses saja (~49 MB) — dan
+memasang *watchdog*: bila jendela terminal ditutup, bahkan dibunuh paksa,
+server mematikan dirinya sendiri dalam ~2 detik sehingga port tidak tertahan.
+
+Bila Anda menjalankan `python -m deepseek_web_api.server` manual dan jendelanya
+hilang tanpa shutdown, jalankan `stop.bat`. Skrip itu **hanya** menghentikan
+proses `deepseek_web_api.server`, bukan Python lain milik Anda.
+
+> `.venv\Scripts\python.exe` adalah *launcher* yang men-spawn proses anak.
+> `start.bat` sengaja memakai `python.exe` asli di dalam venv supaya hanya ada
+> satu proses dan tidak ada yang tertinggal.
 
 Lalu arahkan SDK OpenAI biasa ke server lokal:
 

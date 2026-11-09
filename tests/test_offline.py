@@ -334,6 +334,25 @@ def test_auth() -> None:
     check("mode tak dikenal -> open", check_with("ngawur", {}).ok)
 
 
+def test_watchdog() -> None:
+    print("\n[Watchdog proses yatim]")
+    from deepseek_web_api.server import _getppid
+
+    ppid = _getppid()
+    check("PPID terdeteksi", ppid > 0, f"ppid={ppid}")
+    check("PPID bukan diri sendiri", ppid != os.getpid(), f"ppid={ppid}")
+
+    # Watchdog bisa dimatikan lewat env (penting untuk service/daemon).
+    from deepseek_web_api.server import _start_parent_watchdog
+
+    os.environ["DEEPSEEK_NO_PARENT_WATCHDOG"] = "1"
+    try:
+        _start_parent_watchdog()  # tidak boleh melempar / membuat thread
+        check("watchdog bisa dinonaktifkan via env", True)
+    finally:
+        os.environ.pop("DEEPSEEK_NO_PARENT_WATCHDOG", None)
+
+
 def main() -> int:
     test_pow()
     test_delta()
@@ -341,6 +360,7 @@ def main() -> int:
     test_server_port()
     test_token_parsing()
     test_auth()
+    test_watchdog()
     print("\n" + "=" * 60)
     if failures:
         print(f"FAILED: {len(failures)} -> {failures}")

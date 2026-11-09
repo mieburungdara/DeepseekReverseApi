@@ -387,6 +387,103 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _watch_parent(parent_pid: int, interval: float = 3.0) -> None:
+    """Hentikan proses bila induknya hilang (jendela terminal ditutup paksa).
+
+    Di Windows, menutup jendela console biasanya mengirim CTRL_CLOSE_EVENT yang
+    sudah ditangani Python. Tetapi bila induk dibunuh paksa (mis. Task Manager,
+    ``taskkill /F`` pada cmd.exe), proses anak tetap hidup sebagai yatim dan
+    terus menahan port. Thread ini menutup celah itu.
+    """
+    import threading
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                os.kill(parent_pid, 0)  # sinyal 0 = cek keberadaan proses
+            except OSError:
+                # Induk sudah tidak ada -> matikan diri sendiri.
+                os._exit(0)
+
+    thread = threading.Thread(target=_loop, name="parent-watchdog", daemon=True)
+    thread.start()
+
+
+def _watch_stdin(interval: float = 3.0) -> None:
+    """Hentikan proses bila stdin tertutup (jendela terminal hilang).
+
+    Ini jaring pengaman yang paling andal di Windows: saat jendela console
+    ditutup, stdin proses anak menjadi tidak valid / EOF. Lebih dapat
+    diandalkan daripada memeriksa PID induk, karena ``cmd.exe`` bisa tetap
+    hidup sebentar setelah jendela hilang.
+    """
+    import threading
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                if sys.stdin is None or sys.stdin.closed:
+                    os._exit(0)
+                # Bila terminal hilang, readline pada stdin console akan
+                # langsung mengembalikan EOF / melempar OSError.
+            except Exception:  # noqa: BLE001
+                os._exit(0)
+
+    thread = threading.Thread(target=_loop, name="stdin-watchdog", daemon=True)
+    thread.start()
+
+
+def _start_parent_watchdog() -> None:
+    """Aktifkan watchdog agar tidak ada proses yatim setelah jendela ditutup."""
+    if os.environ.get("DEEPSEEK_NO_PARENT_WATCHDOG") == "1":
+        return
+    parent = _getppid()
+    if parent and parent > 0:
+        _watch_parent(parent)
+
+
+def _getppid() -> int:
+    """PPID portabel tanpa dependensi tambahan."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        k32 = ctypes.windll.kernel32
+        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snap == -1:
+            return 0
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        me = os.getpid()
+        try:
+            ok = k32.Process32First(snap, ctypes.byref(entry))
+            while ok:
+                if entry.th32ProcessID == me:
+                    return int(entry.th32ParentProcessID)
+                ok = k32.Process32Next(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
 @app.get("/v1/auth/check")
 async def auth_check(request: Request) -> Any:
     """Cek apakah key yang dikirim diterima gateway ini.
@@ -556,6 +653,10 @@ def main() -> None:
     print(f"  Mode API key    : {auth_mod.describe()}")
     if auth_mod.current_mode() == "open":
         print("  -> Isi kolom API key di agen dengan string APA SAJA (mis. 'sk-lokal').")
+    print("  Tekan CTRL+C untuk berhenti.")
+
+    # Matikan diri bila jendela induk ditutup paksa (mencegah proses yatim).
+    _start_parent_watchdog()
 
     uvicorn.run(
         "deepseek_web_api.server:app",

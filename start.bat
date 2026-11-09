@@ -3,42 +3,64 @@ REM ============================================================
 REM  start.bat - Jalankan server OpenAI-compatible DeepSeek
 REM
 REM  Pemakaian:
-REM    start.bat                 -> port default 17395
-REM    start.bat 19999           -> port tertentu
-REM    start.bat auto            -> cari port bebas otomatis
+REM    start.bat              -> port default 17395, mode open
+REM    start.bat 19999        -> port tertentu
+REM    start.bat auto         -> cari port bebas otomatis
+REM    start.bat any          -> mode API key: wajib diisi
+REM    start.bat strict       -> mode API key: harus sama
+REM
+REM  CATATAN: skrip ini memakai `python` LANGSUNG (bukan
+REM  .venv\Scripts\python.exe) supaya hanya ada SATU proses.
+REM  Launcher venv men-spawn proses anak, sehingga menutup jendela
+REM  bisa meninggalkan proses yatim yang menahan port.
 REM ============================================================
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title DeepSeek Web API - Server
-
-set "PY=.venv\Scripts\python.exe"
-if not exist "%PY%" set "PY=python"
 
 echo ============================================================
 echo   DeepSeek Web - OpenAI Compatible API
 echo ============================================================
 echo.
 
-REM --- Validasi Python -------------------------------------------------
-"%PY%" --version >nul 2>&1
-if errorlevel 1 (
+REM --- Cari interpreter Python -----------------------------------------
+REM Pakai python.exe asli di dalam venv (bukan launcher di Scripts\).
+set "PY="
+if exist ".venv\pyvenv.cfg" (
+    for /f "tokens=2 delims==" %%A in ('findstr /B /C:"home = " ".venv\pyvenv.cfg"') do (
+        set "HOME_DIR=%%A"
+    )
+)
+if defined HOME_DIR (
+    if exist "!HOME_DIR!\python.exe" set "PY=!HOME_DIR!\python.exe"
+)
+if not defined PY (
+    where python >nul 2>&1
+    if not errorlevel 1 set "PY=python"
+)
+if not defined PY (
     echo [GAGAL] Python tidak ditemukan.
     echo   Jalankan setup.bat terlebih dahulu.
     pause
     exit /b 1
 )
 
-REM --- Validasi token --------------------------------------------------
+REM --- Validasi dependensi ---------------------------------------------
+"%PY%" -c "import fastapi, uvicorn, httpx" >nul 2>&1
+if errorlevel 1 (
+    echo [GAGAL] Dependensi belum terpasang.
+    echo   Jalankan setup.bat terlebih dahulu.
+    pause
+    exit /b 1
+)
+
+REM --- Validasi token ---------------------------------------------------
 set "TOKEN_OK="
 if exist "token.json" set "TOKEN_OK=1"
 if defined DEEPSEEK_TOKEN set "TOKEN_OK=1"
 if not defined TOKEN_OK (
     echo [PERINGATAN] Token belum ada.
-    echo.
-    echo   Server tetap bisa dijalankan, tapi setiap request chat akan
-    echo   gagal dengan error autentikasi.
-    echo.
-    echo   Jalankan login.bat dulu untuk mendapatkan token.
+    echo   Jalankan set-token.bat dulu, atau server akan menolak chat.
     echo.
     choice /C YN /N /M "Lanjutkan tanpa token? [Y/N] "
     if !errorlevel! equ 2 (
@@ -50,50 +72,51 @@ if not defined TOKEN_OK (
 ) else (
     if exist "token.json" set "DEEPSEEK_TOKEN_FILE=token.json"
     echo [OK] Token ditemukan.
-    echo.
 )
 
-REM --- Tentukan argumen port -------------------------------------------
-set "PORTARG="
+REM --- Tentukan argumen ------------------------------------------------
+set "ARGS="
 if /I "%~1"=="auto" (
-    set "PORTARG=--auto-port"
-    echo [OK] Mode auto-port: akan mencari port bebas.
+    set "ARGS=--auto-port"
+    echo [OK] Mode auto-port
 ) else if /I "%~1"=="any" (
-    set "PORTARG=--auth any"
-    echo [OK] Mode API key: any ^(key wajib, isi bebas^)
+    set "ARGS=--auth any"
+    echo [OK] Mode API key: any
 ) else if /I "%~1"=="strict" (
-    set "PORTARG=--auth strict"
-    echo [OK] Mode API key: strict ^(harus sama dengan DEEPSEEK_API_KEY^)
+    set "ARGS=--auth strict"
+    echo [OK] Mode API key: strict
 ) else if not "%~1"=="" (
-    set "PORTARG=--port %~1"
-    echo [OK] Memakai port %~1
+    set "ARGS=--port %~1"
+    echo [OK] Port %~1
 ) else (
-    echo [OK] Memakai port default 17395
-    echo [OK] Mode API key: open ^(isi kolom API key dengan string APA SAJA^)
+    echo [OK] Port default 17395
 )
 echo.
 
 echo ============================================================
-echo   PENTING - kolom API key di agen AI
+echo   KOLOM API KEY DI AGEN AI
 echo ============================================================
 echo.
 echo   Banyak agen ^(Open WebUI, LobeChat, Cursor, dll.^) mewajibkan
-echo   API key diisi. Pada mode default, isi dengan string APA SAJA:
+echo   API key. Pada mode default, isi dengan string APA SAJA:
 echo.
-echo     sk-lokal        atau    123        atau    bebas
+echo     sk-lokal        123        bebas
 echo.
-echo   Base URL  : http://127.0.0.1:17395/v1
-echo   Model     : deepseek-chat  /  deepseek-reasoner
+echo   Base URL : http://127.0.0.1:17395/v1
+echo   Model    : deepseek-chat  /  deepseek-reasoner
 echo.
 echo ============================================================
 echo   Server berjalan. Tekan CTRL+C untuk menghentikan.
+echo   Menutup jendela ini juga menghentikan server.
 echo ============================================================
 echo.
 
 REM --- Jalankan server -------------------------------------------------
-"%PY%" -m deepseek_web_api.server %PORTARG%
-
+REM Tidak memakai `start` / proses latar: server menjadi proses anak dari
+REM jendela ini, jadi CTRL+C dan penutupan jendela benar-benar mematikannya.
+"%PY%" -m deepseek_web_api.server %ARGS%
 set "EXITCODE=%errorlevel%"
+
 echo.
 if not "%EXITCODE%"=="0" (
     echo ============================================================
@@ -103,7 +126,10 @@ if not "%EXITCODE%"=="0" (
     echo   Bila penyebabnya port bentrok, coba:
     echo     start.bat auto
     echo.
+    echo   Periksa sisa proses dengan:
+    echo     stop.bat
+    echo.
 )
 echo Server dihentikan.
 pause
-endlocal
+endlocal & exit /b %EXITCODE%
