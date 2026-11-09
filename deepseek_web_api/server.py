@@ -30,6 +30,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import auth as auth_mod
+from . import tools as tools_mod
 from .client import DeepSeekWebClient
 from .http import ApiError, AuthError, DeepSeekWebError
 
@@ -191,9 +192,12 @@ def _resolve_model(requested: Optional[str]) -> str:
 def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Collapse an OpenAI message list into ``(system_prompt, user_prompt)``.
 
-    The web endpoint accepts a single ``prompt`` string, so we fold system and
-    prior turns into one labelled transcript. This is a lossy but faithful
-    mapping: the web app has no equivalent of a structured message array.
+    Endpoint web hanya menerima satu string ``prompt``, jadi riwayat dipadatkan
+    menjadi transkrip berlabel. Perlakuan khusus:
+
+    * ``role: "tool"`` -> ``Tool result (<name>): ...`` (bukan "User:")
+    * ``assistant`` dengan ``tool_calls`` -> sertakan panggilan tool yang
+      pernah dilakukan, supaya model tahu apa yang sudah dicoba.
     """
     system_parts: list[str] = []
     turns: list[str] = []
@@ -207,11 +211,26 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
                 for part in content
                 if isinstance(part, dict) and part.get("type") == "text"
             )
-        content = str(content)
+        content = str(content) if content is not None else ""
+
         if role == "system":
             system_parts.append(content)
+
         elif role == "assistant":
-            turns.append(f"Assistant: {content}")
+            parts: list[str] = []
+            if content.strip():
+                parts.append(content)
+            calls_text = tools_mod.format_assistant_tool_calls(
+                message.get("tool_calls")
+            )
+            if calls_text:
+                parts.append(calls_text)
+            turns.append("Assistant: " + ("\n".join(parts) if parts else ""))
+
+        elif role == "tool":
+            name = message.get("name") or message.get("tool_call_id") or "tool"
+            turns.append(f"Tool result ({name}): {content}")
+
         else:
             turns.append(f"User: {content}")
 
@@ -283,6 +302,14 @@ async def chat_completions(request: Request):
     model_type = _resolve_model(body.get("model"))
     options = _extract_options(body, model_type)
     _, prompt = _flatten_messages(messages)
+
+    # Tool calling: suntikkan definisi tool ke prompt (DeepSeek web tidak punya
+    # API tool resmi). Model akan membalas dengan baris `do: {...}` atau DSML.
+    request_tools = body.get("tools")
+    tool_prompt = tools_mod.build_tool_prompt(request_tools, body.get("tool_choice"))
+    if tool_prompt:
+        prompt = f"{prompt}\n\n{tool_prompt}"
+
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt is empty")
 
@@ -297,6 +324,17 @@ async def chat_completions(request: Request):
         except (DeepSeekWebError, Exception) as exc:  # noqa: BLE001
             return _error_response(exc)
 
+        content, tool_calls = tools_mod.parse_response(text, request_tools)
+
+        message: dict[str, Any] = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
+        else:
+            # Pastikan content bukan null untuk jawaban biasa.
+            message["content"] = content
+            finish_reason = "stop"
+
         return JSONResponse(
             content={
                 "id": completion_id,
@@ -306,8 +344,8 @@ async def chat_completions(request: Request):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {
@@ -320,15 +358,65 @@ async def chat_completions(request: Request):
 
     async def event_stream() -> AsyncIterator[bytes]:
         yield _sse_chunk(completion_id, created, requested_model, {"role": "assistant"})
+
+        # Model web mengirim potongan sangat kecil (kadang satu karakter), jadi
+        # mendeteksi "do:" per potongan tidak mungkin. Strategi: tahan SELALU
+        # selama beberapa karakter pertama, dan begitu teks dipastikan bukan
+        # tool call, lepas dan alirkan sisanya langsung.
+        buffer: list[str] = []
+        decided = False  # sudah dipastikan bukan tool call?
+        HOLD_CHARS = 40  # cukup untuk melihat "do: {...}" atau awal DSML
+
         try:
             async for chunk in client.stream_text(prompt, **options):
-                if chunk:
+                if not chunk:
+                    continue
+                buffer.append(chunk)
+
+                if decided:
                     yield _sse_chunk(
                         completion_id, created, requested_model, {"content": chunk}
                     )
+                    continue
+
+                held = "".join(buffer)
+                if tools_mod.has_dsml(held) or _looks_like_tool_start(held):
+                    # Masih mungkin tool call -> tahan.
+                    continue
+
+                if len(held) >= HOLD_CHARS:
+                    # Cukup panjang dan bukan tool call -> lepas semuanya.
+                    decided = True
+                    yield _sse_chunk(
+                        completion_id, created, requested_model, {"content": held}
+                    )
+                    buffer = []
         except Exception as exc:  # noqa: BLE001
             yield _sse_error(completion_id, created, requested_model, str(exc))
             return
+
+        tail = "".join(buffer)
+        if tail:
+            content, tool_calls = tools_mod.parse_response(tail, request_tools)
+            if content:
+                yield _sse_chunk(
+                    completion_id, created, requested_model, {"content": content}
+                )
+            if tool_calls:
+                for index, call in enumerate(tool_calls):
+                    yield _sse_tool_call_delta(
+                        completion_id, created, requested_model, index, call
+                    )
+                yield _sse_chunk(
+                    completion_id,
+                    created,
+                    requested_model,
+                    {},
+                    finish_reason="tool_calls",
+                )
+                yield b"data: [DONE]\n\n"
+                return
+
         yield _sse_chunk(
             completion_id, created, requested_model, {}, finish_reason="stop"
         )
@@ -343,6 +431,65 @@ async def chat_completions(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _looks_like_tool_start(text: str) -> bool:
+    """Apakah teks (mungkin belum lengkap) tampak seperti awal tool call?
+
+    Dipakai untuk menahan output di tengah streaming agar markup DSML tidak
+    terlanjur terkirim ke klien sebagai teks biasa.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    # Awal DSML yang mungkin belum lengkap, mis. "<" atau "<｜"
+    if stripped.startswith("<") and len(stripped) <= 24:
+        if not stripped.endswith(">"):
+            return True
+    if tools_mod.has_dsml(stripped):
+        return True
+    if stripped.lower().startswith(tools_mod.DO_PREFIX):
+        return True
+    # "do:" muncul setelah baris baru
+    last_line = stripped.rsplit("\n", 1)[-1].strip().lower()
+    return last_line.startswith(tools_mod.DO_PREFIX)
+
+
+def _sse_tool_call_delta(
+    completion_id: str,
+    created: int,
+    model: str,
+    index: int,
+    call: dict[str, Any],
+) -> bytes:
+    """Satu potongan SSE berisi satu tool_call (format streaming OpenAI)."""
+    fn = call.get("function") or {}
+    payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": call.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": fn.get("name", ""),
+                                "arguments": fn.get("arguments", "{}"),
+                            },
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def _sse_chunk(

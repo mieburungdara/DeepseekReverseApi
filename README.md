@@ -24,6 +24,8 @@ dibutuhkan setiap request chat.
 | `deepseek_web_api/keccak23.py` | **Keccak 23 ronde** (hash khas DeepSeek) |
 | `deepseek_web_api/pow.py` | Solver `DeepSeekHashV1` (native C / Python) |
 | `deepseek_web_api/stream.py` | Parser delta SSE (stateful JSON-Patch) |
+| `deepseek_web_api/dsml.py` | Parser tool-call DSML bawaan DeepSeek |
+| `deepseek_web_api/tools.py` | Jembatan tool calling → format OpenAI |
 | `deepseek_web_api/client.py` | Client async: login, PoW, chat, multi-turn |
 | `deepseek_web_api/server.py` | Server OpenAI-compatible |
 | `native/deepseek_pow.c` | Solver C (~1,3 juta hash/detik) |
@@ -289,6 +291,49 @@ python -m tests.test_offline     # tanpa jaringan, 20 assertion
 python -m tests.live_probe       # ke server asli; butuh DEEPSEEK_TOKEN
 ```
 
+## Tool calling (function calling)
+
+DeepSeek web tidak punya API tool resmi, jadi gateway ini menjembatani:
+
+1. Definisi `tools` dari request disuntikkan ke prompt.
+2. Model diminta membalas `do: {"name":...,"arguments":{...}}`.
+3. Bila model tetap mengeluarkan format internal **DSML** (seperti
+   `<｜｜DSML｜｜ invoke name="bash">`), gateway mem-parse-nya juga.
+4. Hasilnya dikembalikan sebagai `tool_calls` OpenAI yang sah, dengan
+   `finish_reason: "tool_calls"`.
+
+Berlaku untuk **non-streaming maupun streaming**. Riwayat `role: "tool"` dan
+`tool_calls` asisten ikut dipadatkan dengan benar, jadi agen bisa melakukan
+beberapa putaran tool.
+
+```python
+resp = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "Jalankan pwd; ls -la"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Jalankan perintah shell",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }],
+)
+print(resp.choices[0].finish_reason)            # "tool_calls"
+print(resp.choices[0].message.tool_calls[0].function.arguments)
+```
+
+`tool_choice` didukung: `"none"`, `"required"`, atau
+`{"type":"function","function":{"name":"..."}}`.
+
+> Karena berbasis prompt, kepatuhan model tidak 100%. Bila tool call tidak
+> terdeteksi, coba `deepseek-reasoner` (mode expert) atau perjelas deskripsi
+> tool-nya.
+
 ## Batasan yang diketahui
 
 - **PoW sekali pakai.** Setiap request chat butuh challenge baru (~0,11 s dengan
@@ -305,5 +350,6 @@ python -m tests.live_probe       # ke server asli; butuh DEEPSEEK_TOKEN
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
 
 
