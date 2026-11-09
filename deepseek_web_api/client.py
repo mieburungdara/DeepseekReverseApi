@@ -28,6 +28,7 @@ from .http import (
     DEFAULT_UA,
     ApiError,
     AuthError,
+    ChallengeRequiredError,
     DeepSeekWebError,
     NetworkError,
     TokenState,
@@ -364,8 +365,59 @@ class DeepSeekWebClient:
                     f"completion failed HTTP {response.status_code}", payload=text[:400]
                 )
 
+            # DeepSeek kadang membalas JSON (bukan SSE) walau status 200.
+            # Kasus terpenting: 40303 CHALLENGE_REQUIRED (hCaptcha). Tanpa
+            # pemeriksaan ini, error tersebut tampak seperti "jawaban kosong".
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "text/event-stream" not in content_type:
+                raw = await response.aread()
+                text = raw.decode("utf-8", "replace")
+                raise self._explain_non_stream_error(text)
+
             async for event in _iter_sse(response):
                 yield event
+
+    @staticmethod
+    def _explain_non_stream_error(text: str) -> DeepSeekWebError:
+        """Ubah balasan JSON non-SSE menjadi error yang bisa ditindaklanjuti."""
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return NetworkError(
+                "completion tidak mengembalikan SSE", payload=text[:400]
+            )
+
+        code = payload.get("code")
+        msg = payload.get("msg") or ""
+        data = payload.get("data") or {}
+
+        if code == 40303 or msg == "CHALLENGE_REQUIRED":
+            provider = data.get("provider") or "captcha"
+            return ChallengeRequiredError(
+                f"DeepSeek meminta verifikasi {provider} (40303 CHALLENGE_REQUIRED). "
+                "Buka chat.deepseek.com di browser, selesaikan captcha, lalu coba lagi. "
+                "Bila sering terjadi, kurangi laju permintaan.",
+                code=code,
+                payload=payload,
+            )
+        if code == 40029:
+            return NetworkError(
+                "IP dibatasi oleh DeepSeek (40029 IP_ACCESS_RESTRICTED). "
+                "Coba lagi nanti atau ganti jaringan.",
+                code=code,
+                payload=payload,
+            )
+        if code == 50006:
+            return NetworkError(
+                "Akun sedang dibisukan sementara oleh DeepSeek (50006 MUTED).",
+                code=code,
+                payload=payload,
+            )
+        return NetworkError(
+            f"completion gagal: code={code} msg={msg or 'tanpa pesan'}",
+            code=code,
+            payload=payload,
+        )
 
     async def chat(
         self,

@@ -39,6 +39,35 @@ class Conversation:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     turns: int = 0
+    #: Sidik jari daftar pesan terakhir yang sudah dikirim ke DeepSeek.
+    #: Dipakai untuk mendeteksi apakah klien menambah pesan baru saja
+    #: (mode delta) atau mengganti/mengulang riwayat (perlu kirim penuh).
+    history_fingerprint: Optional[str] = None
+    #: Jumlah pesan (di luar system) saat terakhir dikirim.
+    history_len: int = 0
+    #: True bila sesi DeepSeek sudah pernah menerima isi percakapan ini.
+    seeded: bool = False
+
+
+def messages_fingerprint(messages: list[dict[str, Any]]) -> str:
+    """Sidik jari urutan pesan (role + isi), untuk deteksi perubahan riwayat."""
+    hasher = hashlib.sha256()
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "")
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        hasher.update(str(role).encode("utf-8", "replace"))
+        hasher.update(b"\x00")
+        hasher.update(str(content or "").encode("utf-8", "replace"))
+        hasher.update(b"\x01")
+    return hasher.hexdigest()[:32]
 
 
 def conversation_key(
@@ -127,6 +156,61 @@ class SessionStore:
         conv.turns += 1
         if parent_message_id is not None:
             conv.parent_message_id = parent_message_id
+
+    def should_send_delta(
+        self,
+        key: str,
+        messages: list[dict[str, Any]],
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Putuskan apakah cukup kirim pesan baru, atau perlu riwayat penuh.
+
+        Return ``(pakai_delta, pesan_yang_harus_dikirim)``.
+
+        Delta hanya dipakai bila SEMUA ini benar:
+          * sesi ini sudah pernah menerima isi percakapan (``seeded``),
+          * riwayat klien masih merupakan lanjutan (prefix cocok),
+          * ada pesan baru setelah pesan terakhir yang kita kirim.
+
+        Selain itu, kirim riwayat penuh (aman untuk sesi baru/berubah).
+        """
+        conv = self._items.get(key)
+        if conv is None or not conv.seeded or not conv.history_fingerprint:
+            return False, messages
+
+        convo = [m for m in messages or [] if isinstance(m, dict) and m.get("role") != "system"]
+        # Klien harus mengirim paling tidak sebanyak yang terakhir kita lihat.
+        if len(convo) <= conv.history_len:
+            return False, messages
+
+        # Pesan yang sudah kita kirim harus identik (prefix cocok).
+        prefix_fp = messages_fingerprint(convo[: conv.history_len])
+        if prefix_fp != conv.history_fingerprint:
+            return False, messages
+
+        return True, convo[conv.history_len:]
+
+    def mark_sent(
+        self,
+        key: str,
+        messages: list[dict[str, Any]],
+        *,
+        delta: bool = False,
+    ) -> None:
+        """Catat riwayat yang baru saja dikirim ke DeepSeek.
+
+        ``delta=True`` berarti kita hanya mengirim pesan baru, jadi sidik jari
+        harus digabung dengan yang lama (seluruh riwayat tetap tercatat).
+        """
+        conv = self._items.get(key)
+        if conv is None:
+            return
+        convo = [m for m in messages or [] if isinstance(m, dict) and m.get("role") != "system"]
+        # Selalu catat sidik jari SELURUH riwayat (bukan hanya delta), agar
+        # pemeriksaan prefix pada giliran berikutnya membandingkan hal setara.
+        conv.history_fingerprint = messages_fingerprint(convo)
+        conv.history_len = len(convo)
+        conv.seeded = True
+        conv.updated_at = time.time()
 
     def forget(self, key: str) -> None:
         self._items.pop(key, None)

@@ -34,7 +34,7 @@ from . import auth as auth_mod
 from . import sessions as sessions_mod
 from . import tools as tools_mod
 from .client import DeepSeekWebClient
-from .http import ApiError, AuthError, DeepSeekWebError
+from .http import ApiError, AuthError, ChallengeRequiredError, DeepSeekWebError
 
 #: Port default: di luar rentang ephemeral (49152-65535), tidak dipakai layanan
 #: umum, dan tidak terdaftar di IANA untuk protokol apa pun.
@@ -263,6 +263,18 @@ def _summarize_dropped(messages: list[dict[str, Any]]) -> str:
     return "\n".join(bits)
 
 
+def _prompt_mode() -> str:
+    """Mode penyusunan prompt: ``delta`` (default) atau ``full``.
+
+    ``delta``  - kirim hanya pesan baru bila sesi DeepSeek sudah punya isi
+                 percakapan; riwayat penuh hanya saat "seed" (sesi baru,
+                 server restart, atau riwayat klien berubah). Jauh lebih hemat.
+    ``full``   - selalu kirim riwayat (perilaku konservatif).
+    """
+    mode = (os.environ.get("DEEPSEEK_PROMPT_MODE") or "delta").strip().lower()
+    return mode if mode in ("delta", "full") else "delta"
+
+
 def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Collapse an OpenAI message list into ``(system_prompt, user_prompt)``.
 
@@ -362,6 +374,18 @@ def _completion_id() -> str:
 
 
 def _error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ChallengeRequiredError):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "upstream_error",
+                    "code": "challenge_required",
+                    "param": None,
+                }
+            },
+        )
     if isinstance(exc, AuthError):
         status, etype, code = 401, "authentication_error", "invalid_api_key"
     elif isinstance(exc, ApiError):
@@ -402,17 +426,11 @@ async def chat_completions(request: Request):
 
     model_type = _resolve_model(body.get("model"))
     options = _extract_options(body, model_type)
-    _, prompt = _flatten_messages(messages)
 
     # Tool calling: suntikkan definisi tool ke prompt (DeepSeek web tidak punya
     # API tool resmi). Model akan membalas dengan baris `do: {...}` atau DSML.
     request_tools = body.get("tools")
     tool_prompt = tools_mod.build_tool_prompt(request_tools, body.get("tool_choice"))
-    if tool_prompt:
-        prompt = f"{prompt}\n\n{tool_prompt}"
-
-    if not prompt.strip():
-        raise HTTPException(status_code=400, detail="Prompt is empty")
 
     client = get_client()
     completion_id = _completion_id()
@@ -425,6 +443,36 @@ async def chat_completions(request: Request):
     # kehilangan konteks antar giliran.
     conv_key = sessions_mod.conversation_key(body, dict(request.headers))
     conv = sessions_mod.STORE.get(conv_key)
+
+    # --- Tentukan isi prompt: delta (hemat) atau riwayat penuh --------------
+    # DeepSeek menyimpan konteks di sesinya, jadi giliran lanjutan cukup
+    # mengirim pesan baru. Riwayat penuh hanya dikirim saat "seed": sesi baru,
+    # server baru restart, atau klien mengganti riwayatnya.
+    use_delta = False
+    delta_messages: list[dict[str, Any]] = []
+    if _prompt_mode() == "delta" and conv is not None:
+        use_delta, delta_messages = sessions_mod.STORE.should_send_delta(
+            conv_key, messages
+        )
+
+    if use_delta:
+        _, prompt = _flatten_messages(delta_messages)
+        # System prompt tetap disertakan: murah, dan menjaga aturan tetap aktif.
+        system_text = "\n\n".join(
+            str(m.get("content") or "")
+            for m in messages
+            if isinstance(m, dict) and m.get("role") == "system"
+        )
+        if system_text:
+            prompt = f"[System instructions]\n{system_text}\n\n{prompt}"
+    else:
+        _, prompt = _flatten_messages(messages)
+
+    if tool_prompt:
+        prompt = f"{prompt}\n\n{tool_prompt}"
+
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt is empty")
 
     if conv is not None and conv.chat_session_id:
         chat_session_id = conv.chat_session_id
@@ -447,6 +495,13 @@ async def chat_completions(request: Request):
             return
         sessions_mod.STORE.touch(conv_key, parent_message_id=pid)
 
+    def _mark_history_sent() -> None:
+        """Catat bahwa isi percakapan ini sudah diterima sesi DeepSeek.
+
+        Setelah ini, giliran berikutnya cukup mengirim pesan baru.
+        """
+        sessions_mod.STORE.mark_sent(conv_key, messages, delta=use_delta)
+
     if not body.get("stream", False):
         try:
             text, response_id = await client.chat_turn(
@@ -459,6 +514,7 @@ async def chat_completions(request: Request):
             return _error_response(exc)
 
         _remember(response_id)
+        _mark_history_sent()
 
         content, tool_calls = tools_mod.parse_response(text, request_tools)
 
@@ -536,6 +592,10 @@ async def chat_completions(request: Request):
         except Exception as exc:  # noqa: BLE001
             yield _sse_error(completion_id, created, requested_model, str(exc))
             return
+
+        # Stream selesai: isi percakapan sudah diterima sesi DeepSeek, jadi
+        # giliran berikutnya cukup mengirim pesan baru.
+        _mark_history_sent()
 
         tail = "".join(buffer)
         if tail:

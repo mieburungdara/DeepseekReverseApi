@@ -295,43 +295,60 @@ python -m tests.live_probe       # ke server asli; butuh DEEPSEEK_TOKEN
 ## Efisiensi prompt
 
 Endpoint web menerima **satu string** prompt, jadi seluruh riwayat dan definisi
-tool ikut dikirim setiap request. Dua optimasi diterapkan:
+tool ikut dikirim setiap request. Tiga lapis optimasi:
 
-**1. Definisi tool diringkas.** Deskripsi panjang dan JSON Schema verbose
-dibuang; yang tersisa hanya nama tool, nama parameter, tipe, `enum`, dan
-`required`. Terukur pada percakapan nyata dengan 32 tool:
+### 1. Delta adaptif (default) — penghematan terbesar
+
+DeepSeek menyimpan konteks di sesinya, jadi giliran lanjutan **cukup mengirim
+pesan baru**. Riwayat penuh hanya dikirim saat "seed":
+
+- sesi DeepSeek baru dibuat,
+- server baru restart (peta sesi hilang),
+- klien mengganti/mengulang riwayatnya.
+
+Deteksinya memakai sidik jari urutan pesan, jadi aman: bila klien mengubah
+riwayat, gateway otomatis kembali mengirim penuh.
+
+```bash
+$env:DEEPSEEK_PROMPT_MODE="full"    # matikan delta, selalu kirim riwayat
+```
+
+### 2. Definisi tool diringkas
+
+Deskripsi panjang dan JSON Schema verbose dibuang; tersisa nama tool, nama
+parameter, tipe, `enum`, dan `required`. Terukur pada 32 tool asli:
 
 | | Ukuran | Porsi prompt |
 |---|---|---|
 | Verbose | 32.401 char | 43,6% |
 | Ringkas | 5.450 char | 7,3% |
 
-Hemat **83%** pada bagian tool. Deskripsi bisa diaktifkan kembali dengan
-`DEEPSEEK_TOOL_DESC=1` bila model sering salah memanggil tool.
+`DEEPSEEK_TOOL_DESC=1` mengembalikan deskripsi bila model sering salah panggil.
 
-**2. Riwayat lama diringkas.** Hanya `DEEPSEEK_MAX_HISTORY_TURNS` (default 12)
-pesan terakhir yang dikirim penuh; sisanya menjadi blok ringkasan
-("User minta X", "Assistant memanggil tool Y"). Hasil tool dipotong pada
+### 3. Riwayat dipangkas saat seed
+
+Saat mengirim penuh, hanya `DEEPSEEK_MAX_HISTORY_TURNS` (default 12) pesan
+terakhir yang utuh; sisanya menjadi ringkasan. Hasil tool dipotong pada
 `DEEPSEEK_MAX_TOOL_RESULT` karakter (default 4000).
 
-Hasil gabungan pada `contoh.txt` (28 pesan, 32 tool):
+### Hasil terukur (`contoh.txt`: 28 pesan, 32 tool)
 
-```
-prompt LAMA : 55.926 char  (~13.981 token)
-prompt BARU : 29.272 char  (~7.318 token)
-HEMAT       : 26.654 char  (47,7%)
-```
+| Strategi | Char | Token~ | Hemat |
+|---|---|---|---|
+| Lama (riwayat penuh + tool verbose) | 55.926 | 13.981 | — |
+| Sebelumnya (riwayat 12 + tool ringkas) | 29.272 | 7.318 | 47,7% |
+| **Delta + tool ringkas (default)** | **13.245** | **3.311** | **76,3%** |
 
-System prompt **selalu dikirim utuh** karena berisi aturan yang harus dipatuhi.
+System prompt **selalu** disertakan pada giliran delta — murah dan menjaga
+aturan tetap aktif.
 
 ```bash
-$env:DEEPSEEK_MAX_HISTORY_TURNS="20"   # kirim lebih banyak riwayat
+$env:DEEPSEEK_MAX_HISTORY_TURNS="20"   # kirim lebih banyak riwayat saat seed
 $env:DEEPSEEK_MAX_TOOL_RESULT="8000"   # potong hasil tool lebih longgar
-$env:DEEPSEEK_TOOL_DESC="1"            # kembalikan deskripsi tool
 ```
 
-> Catatan: system prompt tidak pernah diduplikasi — ia muncul sekali per
-> request. Yang membengkak adalah definisi tool dan riwayat percakapan.
+> Catatan: system prompt tidak pernah diduplikasi — muncul sekali per request.
+> Yang membengkak adalah definisi tool dan riwayat percakapan.
 
 ## Sesi percakapan
 
@@ -421,18 +438,30 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 
 - **PoW sekali pakai.** Setiap request chat butuh challenge baru (~0,11 s dengan
   solver native). Memakai ulang jawaban membuat server membalas stream kosong.
-- **Tanpa function calling / tool use.** Protokol web tidak mengeksposnya.
+- **hCaptcha (40303 CHALLENGE_REQUIRED).** DeepSeek kadang meminta verifikasi
+  captcha. Gateway kini melaporkan ini sebagai error `429 challenge_required`
+  (bukan "jawaban kosong"). Selesaikan captcha di browser, lalu coba lagi.
+- **Tool calling berbasis prompt.** DeepSeek web tidak punya API tool resmi,
+  jadi definisi tool disuntikkan ke prompt. Kepatuhan model tidak 100% — kalau
+  tool call tak terdeteksi, coba `deepseek-reasoner` atau perjelas `description`.
 - **`temperature`, `top_p`, `max_tokens` diabaikan.** UI web tidak mengirimkannya.
 - **AWS WAF** dapat memblokir (HTTP 202). Set `DEEPSEEK_COOKIES` dengan cookie
   browser (`aws-waf-token=...`) bila terjadi.
-- **Multi-turn** butuh `chat_turn()` + `parent_message_id` (integer). Lewat
-  server OpenAI-compatible, riwayat dilipat menjadi satu transkrip.
-
+- **Multi-turn** sudah ditangani: satu percakapan = satu sesi DeepSeek, dengan
+  `parent_message_id` dilacak otomatis. Lewat server OpenAI-compatible, mode
+  delta mengirim hanya pesan baru; riwayat penuh dikirim saat seed.
+- **Mode delta bergantung pada memori server.** Sesi percakapan disimpan in-memory
+  (default 200 percakapan, TTL 6 jam). Restart server => seed ulang (aman,
+  otomatis). Sesi **di sisi DeepSeek** juga bisa hilang dari sisi mereka; kalau
+  begitu,set `DEEPSEEK_PROMPT_MODE=full` untuk selalu mengirim riwayat.
 ## Struktur hasil reverse engineering
 
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
+
+
 
 
 

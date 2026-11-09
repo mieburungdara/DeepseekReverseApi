@@ -65,6 +65,15 @@ class NetworkError(DeepSeekWebError):
     """The request never produced a usable HTTP response."""
 
 
+class ChallengeRequiredError(DeepSeekWebError):
+    """DeepSeek meminta verifikasi captcha (40303 CHALLENGE_REQUIRED).
+
+    Ini bukan kesalahan kode: akun/IP perlu menyelesaikan captcha di browser.
+    Dipisahkan dari ``NetworkError`` agar bisa ditangani berbeda (mis. berhenti
+    mengirim request dan memberi tahu pengguna).
+    """
+
+
 def timezone_offset_seconds() -> int:
     """UTC offset in seconds, matching the browser's ``utcOffset() * 60``."""
     # ``time.timezone`` is seconds west of UTC, i.e. the sign is inverted.
