@@ -12,6 +12,7 @@ DeepSeek web tidak punya API tool resmi, jadi kita:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional
 
 from .dsml import has_dsml, parse_tool_calls, strip_leaked_markers
@@ -54,33 +55,103 @@ def string_param_keys(tools: Optional[list[dict[str, Any]]]) -> set[str]:
     return keys
 
 
+def _compact_schema(schema: Any) -> dict[str, Any]:
+    """Ringkas JSON Schema: hanya nama, tipe, dan field wajib.
+
+    Deskripsi panjang per parameter dibuang karena mahal (teks prompt) dan
+    jarang mengubah keputusan model. Tipe tetap disertakan agar model tidak
+    salah mengirim angka sebagai string.
+    """
+    if not isinstance(schema, dict):
+        return {}
+    out: dict[str, Any] = {}
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        compact_props: dict[str, Any] = {}
+        for name, spec in props.items():
+            if not isinstance(spec, dict):
+                compact_props[name] = {}
+                continue
+            entry: dict[str, Any] = {}
+            if spec.get("type"):
+                entry["type"] = spec["type"]
+            if spec.get("enum"):
+                entry["enum"] = spec["enum"]
+            items = spec.get("items")
+            if isinstance(items, dict) and items.get("type"):
+                entry["items"] = items["type"]
+            compact_props[name] = entry
+        if compact_props:
+            out["properties"] = compact_props
+    required = schema.get("required")
+    if isinstance(required, list) and required:
+        out["required"] = required
+    return out
+
+
+def compact_tools(tools: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Versi ringkas daftar tool untuk disisipkan ke prompt.
+
+    Membuang ``description`` tingkat tool (opsional, bisa diaktifkan lewat
+    ``DEEPSEEK_TOOL_DESC=1``) dan seluruh deskripsi parameter.
+    """
+    keep_desc = os.environ.get("DEEPSEEK_TOOL_DESC") == "1"
+    out: list[dict[str, Any]] = []
+
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        entry: dict[str, Any] = {"name": name}
+        if keep_desc and fn.get("description"):
+            entry["description"] = str(fn["description"])
+        schema = _compact_schema(fn.get("parameters"))
+        if schema:
+            entry["parameters"] = schema
+        out.append(entry)
+
+    return out
+
+
 def build_tool_prompt(
     tools: Optional[list[dict[str, Any]]],
     tool_choice: Any = None,
 ) -> str:
     """Susun instruksi tool untuk disisipkan ke prompt.
 
+    Memakai definisi ringkas (``compact_tools``) agar tidak membengkakkan
+    prompt: definisi verbose bisa mencapai puluhan ribu karakter dan diulang
+    pada setiap request.
+
     Return string kosong bila tidak ada tool.
     """
     if not tools:
         return ""
 
+    compact = compact_tools(tools)
+    if not compact:
+        return ""
+
     try:
-        definitions = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        definitions = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
-        definitions = str(tools)
+        definitions = str(compact)
 
     lines = [
-        "[Alat yang tersedia]",
+        "[Alat tersedia]",
         definitions,
         "",
-        "Cara memanggil alat: tulis SATU baris yang dimulai dengan 'do:' diikuti",
-        'JSON dengan tepat dua field: "name" dan "arguments". Contoh:',
-        'do: {"name":"nama_alat","arguments":{"arg":"nilai"}}',
-        "Untuk beberapa panggilan, tulis satu baris 'do:' per panggilan.",
-        "Jangan memakai blok kode markdown dan jangan menambahkan penjelasan",
-        "pada baris 'do:'. Bila tidak perlu alat, jawab seperti biasa.",
-        "Alat dijalankan oleh klien; jangan mengaku sudah menjalankannya.",
+        "Panggil alat dengan SATU baris berawalan 'do:' diikuti JSON",
+        '{"name":...,"arguments":{...}}. Satu baris per panggilan.',
+        "Tanpa blok kode markdown, tanpa penjelasan pada baris 'do:'.",
+        "Bila tidak perlu alat, jawab biasa. Alat dijalankan oleh klien;",
+        "jangan mengaku sudah menjalankannya.",
     ]
 
     # tool_choice: "none" melarang, "required" mewajibkan
@@ -225,3 +296,4 @@ def _parse_do_payload(
             "arguments": json.dumps(args, ensure_ascii=False),
         },
     }
+

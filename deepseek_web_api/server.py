@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -190,20 +191,121 @@ def _resolve_model(requested: Optional[str]) -> str:
     return requested
 
 
+#: Jumlah giliran percakapan (user/assistant/tool) yang dikirim penuh.
+#: Sisanya diringkas menjadi satu catatan agar prompt tidak membengkak.
+#: Dibaca ulang setiap request (lewat fungsi) supaya bisa diubah saat runtime.
+DEFAULT_MAX_HISTORY_TURNS = 12
+
+#: Batas karakter per tool result sebelum dipotong.
+DEFAULT_MAX_TOOL_RESULT_CHARS = 4000
+
+
+def _max_history_turns() -> int:
+    raw = os.environ.get("DEEPSEEK_MAX_HISTORY_TURNS")
+    if raw is None:
+        return globals().get("MAX_HISTORY_TURNS", DEFAULT_MAX_HISTORY_TURNS)
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_MAX_HISTORY_TURNS
+
+
+def _max_tool_result_chars() -> int:
+    raw = os.environ.get("DEEPSEEK_MAX_TOOL_RESULT")
+    if raw is None:
+        return globals().get("MAX_TOOL_RESULT_CHARS", DEFAULT_MAX_TOOL_RESULT_CHARS)
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_MAX_TOOL_RESULT_CHARS
+
+
+def _clip(text: str, limit: int, label: str = "") -> str:
+    """Potong teks panjang dengan penanda yang jelas."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = text[:limit]
+    return (
+        f"{head}\n\n[...{label or 'isi'} dipotong: {len(text) - limit:,} karakter "
+        f"lagi tidak ditampilkan]"
+    )
+
+
+def _summarize_dropped(messages: list[dict[str, Any]]) -> str:
+    """Ringkas pesan lama yang dibuang dari prompt.
+
+    Alih-alih membuang total (model kehilangan jejak), kita sisakan inti
+    informasinya: siapa bilang apa, dan tool apa yang dipanggil.
+    """
+    bits: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = "".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        content = str(content).strip()
+        if role == "user" and content:
+            bits.append("User: " + _clip(content.replace("\n", " "), 160))
+        elif role == "assistant":
+            calls = tools_mod.format_assistant_tool_calls(message.get("tool_calls"))
+            if calls:
+                names = re.findall(r'"name":\s*"([^"]+)"', calls)
+                bits.append("Assistant memanggil: " + ", ".join(names or ["tool"]))
+            elif content:
+                bits.append("Assistant: " + _clip(content.replace("\n", " "), 160))
+        elif role == "tool":
+            name = message.get("name") or "tool"
+            bits.append(f"Tool {name} dijalankan")
+    return "\n".join(bits)
+
+
 def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Collapse an OpenAI message list into ``(system_prompt, user_prompt)``.
 
     Endpoint web hanya menerima satu string ``prompt``, jadi riwayat dipadatkan
-    menjadi transkrip berlabel. Perlakuan khusus:
+    menjadi transkrip berlabel.
 
-    * ``role: "tool"`` -> ``Tool result (<name>): ...`` (bukan "User:")
-    * ``assistant`` dengan ``tool_calls`` -> sertakan panggilan tool yang
-      pernah dilakukan, supaya model tahu apa yang sudah dicoba.
+    Untuk menghemat input, hanya ``MAX_HISTORY_TURNS`` giliran terakhir yang
+    dikirim penuh; sisanya diringkas menjadi satu blok catatan. System prompt
+    tetap utuh karena berisi aturan yang harus dipatuhi.
     """
     system_parts: list[str] = []
-    turns: list[str] = []
+    convo: list[dict[str, Any]] = []
 
     for message in messages or []:
+        role = message.get("role", "user")
+        if role == "system":
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            system_parts.append(str(content or ""))
+        else:
+            convo.append(message)
+
+    # Pangkas riwayat lama
+    dropped: list[dict[str, Any]] = []
+    limit = _max_history_turns()
+    if limit > 0 and len(convo) > limit:
+        dropped = convo[: len(convo) - limit]
+        convo = convo[len(convo) - limit:]
+
+    turns: list[str] = []
+    summary = _summarize_dropped(dropped) if dropped else ""
+    if summary:
+        turns.append(
+            f"[Ringkasan percakapan sebelumnya]\n{summary}\n"
+            f"[Akhir ringkasan - {len(dropped)} pesan lama tidak dikirim penuh]"
+        )
+
+    for message in convo:
         role = message.get("role", "user")
         content = message.get("content", "")
         if isinstance(content, list):  # multimodal content parts
@@ -214,10 +316,7 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
             )
         content = str(content) if content is not None else ""
 
-        if role == "system":
-            system_parts.append(content)
-
-        elif role == "assistant":
+        if role == "assistant":
             parts: list[str] = []
             if content.strip():
                 parts.append(content)
@@ -230,7 +329,8 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
 
         elif role == "tool":
             name = message.get("name") or message.get("tool_call_id") or "tool"
-            turns.append(f"Tool result ({name}): {content}")
+            body = _clip(content, _max_tool_result_chars(), f"hasil tool {name}")
+            turns.append(f"Tool result ({name}): {body}")
 
         else:
             turns.append(f"User: {content}")
@@ -937,3 +1037,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

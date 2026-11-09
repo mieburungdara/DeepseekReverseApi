@@ -292,6 +292,47 @@ python -m tests.test_offline     # tanpa jaringan, 20 assertion
 python -m tests.live_probe       # ke server asli; butuh DEEPSEEK_TOKEN
 ```
 
+## Efisiensi prompt
+
+Endpoint web menerima **satu string** prompt, jadi seluruh riwayat dan definisi
+tool ikut dikirim setiap request. Dua optimasi diterapkan:
+
+**1. Definisi tool diringkas.** Deskripsi panjang dan JSON Schema verbose
+dibuang; yang tersisa hanya nama tool, nama parameter, tipe, `enum`, dan
+`required`. Terukur pada percakapan nyata dengan 32 tool:
+
+| | Ukuran | Porsi prompt |
+|---|---|---|
+| Verbose | 32.401 char | 43,6% |
+| Ringkas | 5.450 char | 7,3% |
+
+Hemat **83%** pada bagian tool. Deskripsi bisa diaktifkan kembali dengan
+`DEEPSEEK_TOOL_DESC=1` bila model sering salah memanggil tool.
+
+**2. Riwayat lama diringkas.** Hanya `DEEPSEEK_MAX_HISTORY_TURNS` (default 12)
+pesan terakhir yang dikirim penuh; sisanya menjadi blok ringkasan
+("User minta X", "Assistant memanggil tool Y"). Hasil tool dipotong pada
+`DEEPSEEK_MAX_TOOL_RESULT` karakter (default 4000).
+
+Hasil gabungan pada `contoh.txt` (28 pesan, 32 tool):
+
+```
+prompt LAMA : 55.926 char  (~13.981 token)
+prompt BARU : 29.272 char  (~7.318 token)
+HEMAT       : 26.654 char  (47,7%)
+```
+
+System prompt **selalu dikirim utuh** karena berisi aturan yang harus dipatuhi.
+
+```bash
+$env:DEEPSEEK_MAX_HISTORY_TURNS="20"   # kirim lebih banyak riwayat
+$env:DEEPSEEK_MAX_TOOL_RESULT="8000"   # potong hasil tool lebih longgar
+$env:DEEPSEEK_TOOL_DESC="1"            # kembalikan deskripsi tool
+```
+
+> Catatan: system prompt tidak pernah diduplikasi — ia muncul sekali per
+> request. Yang membengkak adalah definisi tool dan riwayat percakapan.
+
 ## Sesi percakapan
 
 Satu percakapan klien memakai **satu** `chat_session_id` DeepSeek. Sebelumnya
@@ -392,6 +433,7 @@ print(resp.choices[0].message.tool_calls[0].function.arguments)
 Detail lengkap ada di [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md):
 algoritma PoW beserta potongan kode aslinya, format header (base64!), skema
 envelope, protokol SSE + JSON-Patch delta, dan peta endpoint.
+
 
 
 
