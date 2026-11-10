@@ -353,6 +353,438 @@ def test_watchdog() -> None:
         os.environ.pop("DEEPSEEK_NO_PARENT_WATCHDOG", None)
 
 
+def test_retry() -> None:
+    print("\n[Retry otomatis - rate limit 429]")
+    import asyncio
+
+    from deepseek_web_api import retry
+    from deepseek_web_api.http import (
+        AuthError,
+        ChallengeRequiredError,
+        NetworkError,
+        RateLimitError,
+    )
+
+    def with_env(**values):
+        old = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        return old
+
+    def restore_env(old):
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # Hanya error sementara yang diulang.
+    check("RateLimitError diulang", retry.is_retryable(RateLimitError("x")))
+    check(
+        "ChallengeRequiredError diulang",
+        retry.is_retryable(ChallengeRequiredError("x")),
+    )
+    check("PoW 40301 diulang", retry.is_retryable(NetworkError("x", code=40301)))
+    check("AuthError TIDAK diulang", not retry.is_retryable(AuthError("x")))
+    check("NetworkError biasa TIDAK diulang", not retry.is_retryable(NetworkError("x")))
+    check("ValueError TIDAK diulang", not retry.is_retryable(ValueError("x")))
+
+    # Backoff eksponensial 1s -> 2s -> 4s -> 8s, dengan jitter +-20%.
+    old = with_env(DEEPSEEK_RETRY_BASE="1", DEEPSEEK_RETRY_MAX="16")
+    try:
+        bands = [(0.8, 1.2), (1.6, 2.4), (3.2, 4.8), (6.4, 9.6)]
+        delays = [retry.compute_delay(i) for i in range(4)]
+        check(
+            "backoff 1s -> 2s -> 4s -> 8s",
+            all(lo <= d <= hi for d, (lo, hi) in zip(delays, bands)),
+            str([round(d, 2) for d in delays]),
+        )
+        check("dibatasi DEEPSEEK_RETRY_MAX", retry.compute_delay(20) <= 19.2)
+    finally:
+        restore_env(old)
+
+    # Jumlah percobaan: default 3, 0 mematikan, nilai rusak -> 3.
+    old = with_env(DEEPSEEK_MAX_RETRIES="3")
+    try:
+        check("default 3 retry", retry.max_retries() == 3)
+        old2 = with_env(DEEPSEEK_MAX_RETRIES="0")
+        try:
+            check("0 mematikan retry", retry.max_retries() == 0)
+        finally:
+            restore_env(old2)
+        old2 = with_env(DEEPSEEK_MAX_RETRIES="rusak")
+        try:
+            check("nilai rusak -> 3", retry.max_retries() == 3)
+        finally:
+            restore_env(old2)
+    finally:
+        restore_env(old)
+
+    async def run_cases() -> None:
+        old_e = with_env(DEEPSEEK_MAX_RETRIES="3", DEEPSEEK_RETRY_BASE="0.001")
+        try:
+            calls = {"n": 0}
+
+            async def flaky():
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise RateLimitError("too frequent")
+                return "ok"
+
+            result = await retry.call_with_retry(flaky)
+            check("gagal 2x lalu sukses", result == "ok", f"n={calls['n']}")
+
+            calls["n"] = 0
+
+            async def always():
+                calls["n"] += 1
+                raise RateLimitError("too frequent")
+
+            try:
+                await retry.call_with_retry(always)
+                check("menyerah setelah batas", False, "tidak melempar")
+            except RateLimitError:
+                check("menyerah setelah batas", calls["n"] == 4, f"n={calls['n']}")
+
+            # Streaming: gagal sebelum item pertama -> diulang.
+            state = {"n": 0}
+
+            async def fail_before():
+                state["n"] += 1
+                if state["n"] < 2:
+                    raise RateLimitError("too frequent")
+                yield "a"
+                yield "b"
+
+            got = [x async for x in retry.iter_with_retry(fail_before)]
+            check("stream gagal awal -> diulang", got == ["a", "b"], str(got))
+
+            # Streaming: gagal SETELAH item -> tidak diulang (anti duplikasi).
+            state2 = {"n": 0}
+
+            async def fail_after():
+                state2["n"] += 1
+                yield "pertama"
+                raise RateLimitError("too frequent")
+
+            collected = []
+            try:
+                async for item in retry.iter_with_retry(fail_after):
+                    collected.append(item)
+                check("stream gagal setelah item", False, "tidak melempar")
+            except RateLimitError:
+                check(
+                    "stream gagal setelah item -> tidak diulang",
+                    collected == ["pertama"] and state2["n"] == 1,
+                    f"{collected} n={state2['n']}",
+                )
+        finally:
+            restore_env(old_e)
+
+    asyncio.run(run_cases())
+
+
+def test_p0_hardening() -> None:
+    """Regresi untuk perbaikan P0: target PoW, bind policy, dan kunci async."""
+    import asyncio
+    import contextlib
+    import io
+
+    import httpx
+
+    from deepseek_web_api import config, server
+    from deepseek_web_api.client import TurnResult
+    from deepseek_web_api.pow import PowChallenge, PowError, solve
+    from deepseek_web_api.sessions import SessionStore
+
+    print("\n[P0 hardening]")
+
+    # --- 1. Target PoW wajib 64 hex, baik dari API maupun langsung ----------
+    good = "a" * 64
+    base = {
+        "algorithm": "DeepSeekHashV1",
+        "challenge": good,
+        "salt": "s",
+        "difficulty": 100,
+        "signature": "",
+        "expire_at": 1,
+    }
+    for label, patch in (
+        ("target pendek", {"challenge": "abc"}),
+        ("target 65 char", {"challenge": good + "a"}),
+        ("target non-hex", {"challenge": "z" * 64}),
+        ("field hilang", {"challenge": None}),
+        ("difficulty rusak", {"difficulty": "bukan-angka"}),
+    ):
+        payload = dict(base)
+        payload.update(patch)
+        try:
+            PowChallenge.from_api(payload)
+            check(f"from_api tolak {label}", False, "tidak melempar")
+        except PowError:
+            check(f"from_api tolak {label}", True)
+
+    ch = PowChallenge.from_api(dict(base))
+    check("from_api menerima target valid", ch.challenge == good)
+    check(
+        "from_api menormalkan huruf besar",
+        PowChallenge.from_api({**base, "challenge": "A" * 64}).challenge == good,
+    )
+
+    bad = PowChallenge(
+        algorithm="DeepSeekHashV1", challenge="abc", salt="s",
+        difficulty=10, signature="", expire_at=1,
+    )
+    try:
+        solve(bad)
+        check("solve() tolak target pendek", False, "tidak melempar")
+    except PowError:
+        check("solve() tolak target pendek", True)
+
+    # --- 2. Nilai env rusak tidak boleh membuat request gagal --------------
+    old = {k: os.environ.get(k) for k in
+           ("DEEPSEEK_MIN_INTERVAL", "DEEPSEEK_POW_TIMEOUT",
+            "DEEPSEEK_AUTH_MODE", "DEEPSEEK_API_KEY", "DEEPSEEK_MAX_RETRIES")}
+    try:
+        os.environ["DEEPSEEK_MIN_INTERVAL"] = "abc"
+        os.environ["DEEPSEEK_POW_TIMEOUT"] = "xyz"
+        check("min_interval env rusak -> default", config.min_interval() == config.MIN_INTERVAL)
+        check("pow_timeout env rusak -> default", config.pow_timeout() == config.POW_TIMEOUT)
+        os.environ["DEEPSEEK_POW_TIMEOUT"] = "0"
+        check("pow_timeout 0 = tanpa batas", config.pow_timeout() == 0.0)
+
+        # --- 3. Bind non-loopback wajib strict -----------------------------
+        for host, expected in (
+            ("127.0.0.1", True), ("localhost", True), ("::1", True),
+            ("0.0.0.0", False), ("::", False), ("192.168.1.5", False),
+            ("example.com", False),
+        ):
+            check(f"loopback({host})", server.is_loopback_host(host) is expected)
+
+        os.environ["DEEPSEEK_AUTH_MODE"] = "open"
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                server._enforce_bind_policy("0.0.0.0")
+            check("bind 0.0.0.0 + open ditolak", False, "tidak melempar")
+        except SystemExit:
+            check("bind 0.0.0.0 + open ditolak", True)
+
+        os.environ["DEEPSEEK_AUTH_MODE"] = "strict"
+        os.environ["DEEPSEEK_API_KEY"] = "sk-uji"
+        try:
+            server._enforce_bind_policy("0.0.0.0")
+            check("bind 0.0.0.0 + strict diizinkan", True)
+        except SystemExit:
+            check("bind 0.0.0.0 + strict diizinkan", False)
+        os.environ["DEEPSEEK_AUTH_MODE"] = "open"
+
+        # Pertahanan kedua: aplikasi dijalankan langsung lewat uvicorn
+        # (tanpa lewat main) tetap menolak peer non-loopback.
+        class FakeReq:
+            def __init__(self, host, headers=None):
+                self.client = type("Peer", (), {"host": host})()
+                self.headers = headers or {}
+
+        check("peer loopback diizinkan (open)",
+              server._require_auth(FakeReq("127.0.0.1")) is None)
+        denied = server._require_auth(FakeReq("192.168.1.5"))
+        check("peer non-loopback ditolak (open)",
+              denied is not None and denied.status_code == 401)
+        os.environ["DEEPSEEK_AUTH_MODE"] = "strict"
+        os.environ["DEEPSEEK_API_KEY"] = "sk-uji"
+        check("peer non-loopback lolos strict + key",
+              server._require_auth(FakeReq("192.168.1.5",
+                                          {"authorization": "Bearer sk-uji"})) is None)
+        os.environ["DEEPSEEK_AUTH_MODE"] = "open"
+
+        # --- 4. Kunci async ------------------------------------------------
+        async def run_async_cases():
+            # Throttle: dua pemanggil konkuren harus berjarak >= interval.
+            os.environ["DEEPSEEK_MIN_INTERVAL"] = "0.12"
+            server._last_request_at = __import__("time").monotonic()
+
+            async def one():
+                await server._throttle()
+                return __import__("time").monotonic()
+
+            a, b = await asyncio.gather(one(), one())
+            check("throttle terserialisasi", abs(a - b) >= 0.10, f"delta={abs(a-b):.3f}s")
+
+            # get_client: tepat satu instance walau dipanggil bersamaan.
+            class DummyClient:
+                pass
+
+            made = []
+            old_client = server._client
+            old_ctor = server.DeepSeekWebClient
+            server._client = None
+            server.DeepSeekWebClient = lambda **kw: made.append(DummyClient()) or made[-1]
+            try:
+                results = await asyncio.gather(*[server.get_client() for _ in range(6)])
+                check("get_client satu instance", len(made) == 1 and all(r is made[0] for r in results),
+                      f"dibuat={len(made)}")
+            finally:
+                server.DeepSeekWebClient = old_ctor
+                server._client = old_client
+
+            # SessionStore: kunci per-key, stabil, dan model_type tersimpan.
+            st = SessionStore()
+            g1 = st.guard("k1")
+            check("guard stabil per key", st.guard("k1") is g1)
+            check("guard beda per key", st.guard("k2") is not g1)
+            st.put("k1", "sess", model_type="expert")
+            check("model_type tersimpan", st.get("k1").model_type == "expert")
+
+            # Dua request konkuren pada percakapan sama -> SATU sesi baru,
+            # dan parent_message_id giliran kedua sudah ter-update.
+            class FakeClient:
+                def __init__(self):
+                    self.created = 0
+                    self.parents = []
+
+                async def create_session(self, model_type="default"):
+                    self.created += 1
+                    await asyncio.sleep(0.03)
+                    return "sess-fake"
+
+                async def chat_turn(self, prompt, *, chat_session_id,
+                                   parent_message_id=None, **kw):
+                    self.parents.append(parent_message_id)
+                    return TurnResult(text="ok", thinking="", response_id="42")
+
+                async def stream_turn(self, prompt, *, chat_session_id,
+                                     parent_message_id=None, on_response_id=None,
+                                     include_thinking=False, **kw):
+                    if on_response_id is not None:
+                        on_response_id("77")
+                    yield ("content", "halo dunia")
+
+            fake = FakeClient()
+            old_client = server._client
+            server._client = fake
+            server.sessions_mod.STORE.clear()
+            os.environ["DEEPSEEK_MIN_INTERVAL"] = "0"
+            os.environ["DEEPSEEK_MAX_RETRIES"] = "0"
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            try:
+                tr = httpx.ASGITransport(app=server.app, raise_app_exceptions=False)
+                async with httpx.AsyncClient(transport=tr, base_url="http://test") as c:
+                    responses = await asyncio.gather(*[
+                        c.post("/v1/chat/completions", json=payload,
+                               headers={"X-Conversation-Id": "conv-race"})
+                        for _ in range(2)
+                    ])
+                    race_created = fake.created  # sebelum request streaming (percakapan lain)
+                    # Streaming menyerahkan kunci ke generator; kunci harus
+                    # lepas setelah seluruh chunk dikonsumsi.
+                    r = await c.post(
+                        "/v1/chat/completions",
+                        json={**payload, "stream": True},
+                        headers={"X-Conversation-Id": "conv-stream"},
+                    )
+                check("dua request tetap 200", all(r.status_code == 200 for r in responses))
+                check("satu sesi DeepSeek dibuat", race_created == 1,
+                      f"created={race_created}")
+                check("parent giliran ke-2 ter-update", fake.parents == [None, 42],
+                      str(fake.parents))
+                key = server.sessions_mod.conversation_key(
+                    payload, {"x-conversation-id": "conv-race"}
+                )
+                check("kunci percakapan dilepas", not server.sessions_mod.STORE.guard(key).locked())
+
+                check("stream tetap 200", r.status_code == 200, str(r.status_code))
+                check("stream punya [DONE]", "[DONE]" in r.text)
+                key2 = server.sessions_mod.conversation_key(
+                    payload, {"x-conversation-id": "conv-stream"}
+                )
+                check("guard streaming dilepas",
+                      not server.sessions_mod.STORE.guard(key2).locked())
+            finally:
+                server._client = old_client
+                server.sessions_mod.STORE.clear()
+
+            # --- 5. PoW tidak membekukan event loop -------------------------
+            import time as _time
+
+            import deepseek_web_api.client as client_mod
+
+            class StubAnswer:
+                backend = "stub"
+
+                def to_header_value(self):
+                    return "stub"
+
+            original_solver = client_mod.solve_to_answer
+
+            def slow_solve(_challenge, _path):
+                _time.sleep(0.12)
+                return StubAnswer()
+
+            async def fake_challenge(_self, _path):
+                return PowChallenge.from_api(dict(base))
+
+            client_mod.solve_to_answer = slow_solve
+            os.environ["DEEPSEEK_POW_TIMEOUT"] = "5"
+            try:
+                probe = client_mod.DeepSeekWebClient(token="dummy")
+                probe.create_pow_challenge = lambda path: fake_challenge(probe, path)
+                ticks = 0
+                done = False
+
+                async def ticker():
+                    nonlocal ticks
+                    while not done:
+                        ticks += 1
+                        await asyncio.sleep(0.01)
+
+                task = asyncio.create_task(ticker())
+                header = await probe._pow_header("/api/v0/chat/completion")
+                done = True
+                await task
+                check("PoW header tetap terbentuk", "x-ds-pow-response" in header)
+                check("event loop responsif saat PoW", ticks >= 5, f"ticks={ticks}")
+            finally:
+                client_mod.solve_to_answer = original_solver
+
+            # Batas waktu solver dihormati.
+            os.environ["DEEPSEEK_POW_TIMEOUT"] = "0.02"
+            client_mod.solve_to_answer = slow_solve
+            try:
+                probe = client_mod.DeepSeekWebClient(token="dummy")
+                probe.create_pow_challenge = lambda path: fake_challenge(probe, path)
+                try:
+                    await probe._pow_header("/api/v0/chat/completion")
+                    check("PoW timeout ditegakkan", False, "tidak melempar")
+                except Exception as exc:
+                    check("PoW timeout ditegakkan", "batas waktu" in str(exc), str(exc))
+            finally:
+                client_mod.solve_to_answer = original_solver
+
+            # Body rusak -> 400, bukan 500.
+            tr = httpx.ASGITransport(app=server.app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=tr, base_url="http://test") as c:
+                r1 = await c.post("/v1/chat/completions", json=[{"role": "user"}])
+                r2 = await c.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": "hi"}, "rusak"]})
+            check("body list -> 400", r1.status_code == 400, str(r1.status_code))
+            check("pesan bukan objek -> 400", r2.status_code == 400, str(r2.status_code))
+
+        asyncio.run(run_async_cases())
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def main() -> int:
     test_pow()
     test_delta()
@@ -360,7 +792,9 @@ def main() -> int:
     test_server_port()
     test_token_parsing()
     test_auth()
+    test_retry()
     test_watchdog()
+    test_p0_hardening()
     print("\n" + "=" * 60)
     if failures:
         print(f"FAILED: {len(failures)} -> {failures}")

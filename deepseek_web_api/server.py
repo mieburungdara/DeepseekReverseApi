@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -32,6 +33,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import auth as auth_mod
+from . import retry as retry_mod
 from . import sessions as sessions_mod
 from . import tools as tools_mod
 from .client import DeepSeekWebClient
@@ -77,9 +79,10 @@ async def lifespan(_app: FastAPI):
     """Tutup koneksi upstream saat server berhenti."""
     yield
     global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    async with _client_lock:
+        if _client is not None:
+            await _client.aclose()
+            _client = None
 
 
 app = FastAPI(
@@ -89,23 +92,29 @@ app = FastAPI(
 )
 
 _client: Optional[DeepSeekWebClient] = None
+#: Melindungi inisialisasi ``_client``. Tanpa kunci, dua request pertama yang
+#: bersamaan bisa membuat dua AsyncClient; yang pertama tidak pernah ditutup.
+_client_lock = asyncio.Lock()
 
 
-def get_client() -> DeepSeekWebClient:
-    """Lazily build the singleton upstream client from the environment."""
+async def get_client() -> DeepSeekWebClient:
+    """Bangun (atau ambil) singleton upstream client dari environment.
+
+    Async karena harus mengambil kunci inisialisasi. Pemeriksaan ganda di
+    dalam kunci memastikan tetap tepat satu instance walau ada race.
+    """
     global _client
-    if _client is None:
-        token = os.environ.get("DEEPSEEK_TOKEN")
-        token_file = os.environ.get("DEEPSEEK_TOKEN_FILE")
-        email = os.environ.get("DEEPSEEK_EMAIL")
-        password = os.environ.get("DEEPSEEK_PASSWORD")
-        _client = DeepSeekWebClient(
-            token=token,
-            token_file=token_file,
-            email=email,
-            password=password,
-        )
-    return _client
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        if _client is None:
+            _client = DeepSeekWebClient(
+                token=os.environ.get("DEEPSEEK_TOKEN"),
+                token_file=os.environ.get("DEEPSEEK_TOKEN_FILE"),
+                email=os.environ.get("DEEPSEEK_EMAIL"),
+                password=os.environ.get("DEEPSEEK_PASSWORD"),
+            )
+        return _client
 
 
 def _auth_error(message: str) -> JSONResponse:
@@ -126,6 +135,20 @@ def _auth_error(message: str) -> JSONResponse:
 
 def _require_auth(request: Request) -> Optional[JSONResponse]:
     """Return None bila lolos, atau respons 401 bila ditolak."""
+    # Pertahanan kedua: ``main()`` sudah menolak bind non-loopback, tetapi
+    # aplikasi juga bisa dijalankan langsung lewat ``uvicorn ...:app`` tanpa
+    # melewati CLI itu. Kalau peer bukan loopback, mode terbuka tidak boleh
+    # melayani permintaan sama sekali.
+    if auth_mod.current_mode() != "strict":
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client else None
+        if peer and not is_loopback_host(peer):
+            return _auth_error(
+                "Akses jarak jauh ditolak pada mode API key terbuka. "
+                "Set DEEPSEEK_AUTH_MODE=strict dan DEEPSEEK_API_KEY, atau "
+                "jalankan server hanya di localhost."
+            )
+
     result = auth_mod.check(dict(request.headers))
     if result.ok:
         return None
@@ -432,23 +455,27 @@ MIN_REQUEST_INTERVAL = min_interval()
 
 #: Waktu request terakhir ke DeepSeek (monotonic), per proses.
 _last_request_at = 0.0
+#: Kunci harus dipegang selama menunggu, bukan hanya saat menulis timestamp.
+_throttle_lock = asyncio.Lock()
 
 
 async def _throttle() -> None:
     """Tunggu agar jarak antar-request ke DeepSeek cukup jauh.
 
     Tanpa jeda, beberapa request beruntun memicu rate limit dari DeepSeek
-    (respons SSE kosong tanpa error).
+    (respons SSE kosong tanpa error). Tanpa kunci, request konkuren semuanya
+    menghitung jeda dari timestamp lama yang sama lalu berangkat bersamaan.
     """
     global _last_request_at
     interval = min_interval()
     if interval <= 0:
         return
-    now = time.monotonic()
-    wait = interval - (now - _last_request_at)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    _last_request_at = time.monotonic()
+    async with _throttle_lock:
+        now = time.monotonic()
+        wait = interval - (now - _last_request_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_at = time.monotonic()
 
 
 # ----------------------------------------------------------------- completion
@@ -466,9 +493,15 @@ async def chat_completions(request: Request):
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Request body must be JSON")
 
+    # Validasi bentuk dasar. Tanpa ini payload rusak membuat ``.get()``
+    # melempar AttributeError yang berujung HTTP 500 alih-alih 400.
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="'messages' must be a non-empty array")
+    if any(not isinstance(m, dict) for m in messages):
+        raise HTTPException(status_code=400, detail="Every message must be a JSON object")
 
     model_type = _resolve_model(body.get("model"))
     options = _extract_options(body, model_type)
@@ -478,7 +511,7 @@ async def chat_completions(request: Request):
     request_tools = body.get("tools")
     tool_prompt = tools_mod.build_tool_prompt(request_tools, body.get("tool_choice"))
 
-    client = get_client()
+    client = await get_client()
     completion_id = _completion_id()
     created = int(time.time())
     requested_model = body.get("model") or DEFAULT_MODEL
@@ -488,221 +521,286 @@ async def chat_completions(request: Request):
     # request membuat sesi baru: riwayat menumpuk di server DeepSeek dan model
     # kehilangan konteks antar giliran.
     conv_key = sessions_mod.conversation_key(body, dict(request.headers))
-    conv = sessions_mod.STORE.get(conv_key)
 
-    # --- Tentukan isi prompt: delta (hemat) atau riwayat penuh --------------
-    # DeepSeek menyimpan konteks di sesinya, jadi giliran lanjutan cukup
-    # mengirim pesan baru. Riwayat penuh hanya dikirim saat "seed": sesi baru,
-    # server baru restart, atau klien mengganti riwayatnya.
-    use_delta = False
-    delta_messages: list[dict[str, Any]] = []
-    if _prompt_mode() == "delta" and conv is not None:
-        use_delta, delta_messages = sessions_mod.STORE.should_send_delta(
-            conv_key, messages
-        )
+    # Satu percakapan hanya boleh menjalankan SATU giliran pada satu waktu.
+    # Tanpa kunci ini dua request bersamaan membuat dua sesi DeepSeek, saling
+    # menimpa, dan memakai parent_message_id yang sama. Kunci dipegang sampai
+    # giliran selesai; untuk streaming kepemilikannya diserahkan ke generator
+    # (lihat ``handed_off``), karena generator berjalan setelah handler return.
+    conv_guard = sessions_mod.STORE.guard(conv_key)
+    await conv_guard.acquire()
+    handed_off = False
 
-    if use_delta:
-        _, prompt = _flatten_messages(delta_messages)
-        # System prompt tetap disertakan: murah, dan menjaga aturan tetap aktif.
-        system_text = "\n\n".join(
-            str(m.get("content") or "")
-            for m in messages
-            if isinstance(m, dict) and m.get("role") == "system"
-        )
-        if system_text:
-            prompt = f"[System instructions]\n{system_text}\n\n{prompt}"
-    else:
-        _, prompt = _flatten_messages(messages)
+    try:
+        conv = sessions_mod.STORE.get(conv_key)
 
-    if tool_prompt:
-        prompt = f"{prompt}\n\n{tool_prompt}"
-
-    if not prompt.strip():
-        raise HTTPException(status_code=400, detail="Prompt is empty")
-
-    if conv is not None and conv.chat_session_id:
-        chat_session_id = conv.chat_session_id
-        parent_message_id = conv.parent_message_id
-    else:
-        try:
-            chat_session_id = await client.create_session(model_type=model_type)
-        except Exception as exc:  # noqa: BLE001
-            return _error_response(exc)
-        parent_message_id = None
-        conv = sessions_mod.STORE.put(
-            conv_key, chat_session_id, parent_message_id=None, model_type=model_type
-        )
-
-    def _remember(response_id: Any) -> None:
-        """Simpan id pesan asisten untuk dipakai sebagai induk berikutnya."""
-        try:
-            pid = int(response_id)
-        except (TypeError, ValueError):
-            return
-        sessions_mod.STORE.touch(conv_key, parent_message_id=pid)
-
-    def _mark_history_sent() -> None:
-        """Catat bahwa isi percakapan ini sudah diterima sesi DeepSeek.
-
-        Setelah ini, giliran berikutnya cukup mengirim pesan baru.
-        """
-        sessions_mod.STORE.mark_sent(conv_key, messages, delta=use_delta)
-
-    if not body.get("stream", False):
-
-        await _throttle()
-        try:
-            turn = await client.chat_turn(
-                prompt,
-                chat_session_id=chat_session_id,
-                parent_message_id=parent_message_id,
-                **options,
+        # --- Tentukan isi prompt: delta (hemat) atau riwayat penuh ----------
+        # DeepSeek menyimpan konteks di sesinya, jadi giliran lanjutan cukup
+        # mengirim pesan baru. Riwayat penuh hanya dikirim saat "seed": sesi
+        # baru, server baru restart, atau klien mengganti riwayatnya.
+        use_delta = False
+        delta_messages: list[dict[str, Any]] = []
+        if _prompt_mode() == "delta" and conv is not None:
+            use_delta, delta_messages = sessions_mod.STORE.should_send_delta(
+                conv_key, messages
             )
-        except (DeepSeekWebError, Exception) as exc:  # noqa: BLE001
-            return _error_response(exc)
 
-        text = turn.text
-        _remember(turn.response_id)
-        _mark_history_sent()
-
-        content, tool_calls = tools_mod.parse_response(text, request_tools)
-
-        message: dict[str, Any] = {"role": "assistant", "content": content or None}
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-            finish_reason = "tool_calls"
+        if use_delta:
+            _, prompt = _flatten_messages(delta_messages)
+            # System prompt tetap disertakan: murah, dan menjaga aturan tetap aktif.
+            system_text = "\n\n".join(
+                str(m.get("content") or "")
+                for m in messages
+                if isinstance(m, dict) and m.get("role") == "system"
+            )
+            if system_text:
+                prompt = f"[System instructions]\n{system_text}\n\n{prompt}"
         else:
-            # Pastikan content bukan null untuk jawaban biasa.
-            message["content"] = content
-            finish_reason = "stop"
+            _, prompt = _flatten_messages(messages)
 
-        # Model expert (deepseek-reasoner) menghasilkan proses berpikir.
-        # Ekspos sebagai reasoning_content, konvensi DeepSeek API resmi.
-        if turn.thinking:
-            message["reasoning_content"] = turn.thinking
+        if tool_prompt:
+            prompt = f"{prompt}\n\n{tool_prompt}"
 
-        return JSONResponse(
-            content={
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": requested_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": finish_reason,
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": len(prompt) // 4,
-                    "completion_tokens": len(text) // 4,
-                    "total_tokens": (len(prompt) + len(text)) // 4,
-                },
-            }
-        )
+        if not prompt.strip():
+            raise HTTPException(status_code=400, detail="Prompt is empty")
 
-    async def event_stream() -> AsyncIterator[bytes]:
+        # Aman membuat sesi di sini: kunci percakapan sudah dipegang, jadi
+        # tidak ada request lain yang bisa membuat sesi untuk key yang sama
+        # selagi ``await`` berlangsung.
+        if conv is not None and conv.chat_session_id:
+            chat_session_id = conv.chat_session_id
+            parent_message_id = conv.parent_message_id
+        else:
+            try:
+                chat_session_id = await client.create_session(model_type=model_type)
+            except Exception as exc:  # noqa: BLE001
+                return _error_response(exc)
+            parent_message_id = None
+            conv = sessions_mod.STORE.put(
+                conv_key, chat_session_id, parent_message_id=None, model_type=model_type
+            )
 
-        await _throttle()
-        yield _sse_chunk(completion_id, created, requested_model, {"role": "assistant"})
+        def _remember(response_id: Any) -> None:
+            """Simpan id pesan asisten untuk dipakai sebagai induk berikutnya."""
+            try:
+                pid = int(response_id)
+            except (TypeError, ValueError):
+                return
+            sessions_mod.STORE.touch(conv_key, parent_message_id=pid)
 
-        # Model web mengirim potongan sangat kecil (kadang satu karakter), jadi
-        # mendeteksi "do:" per potongan tidak mungkin. Strategi: tahan SELALU
-        # selama beberapa karakter pertama, dan begitu teks dipastikan bukan
-        # tool call, lepas dan alirkan sisanya langsung.
-        buffer: list[str] = []
-        decided = False  # sudah dipastikan bukan tool call?
-        HOLD_CHARS = 40  # cukup untuk melihat "do: {...}" atau awal DSML
-        want_thinking = bool(options.get("thinking_enabled"))
+        def _mark_history_sent() -> None:
+            """Catat bahwa isi percakapan ini sudah diterima sesi DeepSeek.
 
-        try:
-            async for kind, chunk in client.stream_turn(
-                prompt,
-                chat_session_id=chat_session_id,
-                parent_message_id=parent_message_id,
-                on_response_id=_remember,
-                include_thinking=want_thinking,
-                **options,
-            ):
-                if not chunk:
-                    continue
+            Setelah ini, giliran berikutnya cukup mengirim pesan baru.
+            """
+            sessions_mod.STORE.mark_sent(conv_key, messages, delta=use_delta)
 
-                # Proses berpikir (model expert) dialirkan terpisah sebagai
-                # reasoning_content; tidak ikut buffer tool-call.
-                if kind == "thinking":
+        def _log_retry(attempt: int, delay: float, exc: BaseException) -> None:
+            """Catat retry ke stderr agar terlihat di log server."""
+            print(
+                f"[deepseek] retry {attempt}/{retry_mod.max_retries()} "
+                f"dalam {delay:.1f}s: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if not body.get("stream", False):
+
+            async def _turn_attempt():
+                """Satu percobaan giliran non-streaming (throttle + kirim)."""
+                await _throttle()
+                return await client.chat_turn(
+                    prompt,
+                    chat_session_id=chat_session_id,
+                    parent_message_id=parent_message_id,
+                    **options,
+                )
+
+            try:
+                turn = await retry_mod.call_with_retry(
+                    _turn_attempt, on_retry=_log_retry
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _error_response(exc)
+
+            text = turn.text
+            _remember(turn.response_id)
+            _mark_history_sent()
+
+            content, tool_calls = tools_mod.parse_response(text, request_tools)
+
+            message: dict[str, Any] = {"role": "assistant", "content": content or None}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+                finish_reason = "tool_calls"
+            else:
+                # Pastikan content bukan null untuk jawaban biasa.
+                message["content"] = content
+                finish_reason = "stop"
+
+            # Model expert (deepseek-reasoner) menghasilkan proses berpikir.
+            # Ekspos sebagai reasoning_content, konvensi DeepSeek API resmi.
+            if turn.thinking:
+                message["reasoning_content"] = turn.thinking
+
+            return JSONResponse(
+                content={
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": requested_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt) // 4,
+                        "completion_tokens": len(text) // 4,
+                        "total_tokens": (len(prompt) + len(text)) // 4,
+                    },
+                }
+            )
+
+        async def _event_stream_body() -> AsyncIterator[bytes]:
+
+            # Model web mengirim potongan sangat kecil (kadang satu karakter),
+            # jadi mendeteksi "do:" per potongan tidak mungkin. Strategi:
+            # tahan SELALU selama beberapa karakter pertama, dan begitu teks
+            # dipastikan bukan tool call, lepas dan alirkan sisanya langsung.
+            buffer: list[str] = []
+            decided = False  # sudah dipastikan bukan tool call?
+            HOLD_CHARS = 40  # cukup untuk melihat "do: {...}" atau awal DSML
+            want_thinking = bool(options.get("thinking_enabled"))
+
+            async def _open_stream_after_throttle():
+                """Satu percobaan stream: throttle dulu, lalu buka stream baru.
+
+                Harus berupa generator (bukan coroutine) agar
+                ``iter_with_retry`` bisa mengulanginya; objek stream tidak
+                boleh dipakai ulang.
+                """
+                await _throttle()
+                async for item in client.stream_turn(
+                    prompt,
+                    chat_session_id=chat_session_id,
+                    parent_message_id=parent_message_id,
+                    on_response_id=_remember,
+                    include_thinking=want_thinking,
+                    **options,
+                ):
+                    yield item
+
+            # Role chunk dikirim lebih dulu agar klien segera melihat respons
+            # mulai mengalir (TTFB). Isinya hanya metadata, bukan jawaban,
+            # jadi aman dikirim sebelum retry: ``iter_with_retry`` tetap
+            # menjaga agar tidak ada KONTEN yang terduplikasi.
+            yield _sse_chunk(completion_id, created, requested_model, {"role": "assistant"})
+
+            try:
+                # Retry hanya aman selama belum ada konten terkirim ke klien;
+                # setelah itu mengulang akan menduplikasi teks. ``_throttle``
+                # ikut diulang agar percobaan berikutnya menghormati jeda.
+                async for kind, chunk in retry_mod.iter_with_retry(
+                    _open_stream_after_throttle,
+                    on_retry=_log_retry,
+                ):
+                    if not chunk:
+                        continue
+
+                    # Proses berpikir (model expert) dialirkan terpisah sebagai
+                    # reasoning_content; tidak ikut buffer tool-call.
+                    if kind == "thinking":
+                        yield _sse_chunk(
+                            completion_id,
+                            created,
+                            requested_model,
+                            {"reasoning_content": chunk},
+                        )
+                        continue
+
+                    buffer.append(chunk)
+
+                    if decided:
+                        yield _sse_chunk(
+                            completion_id, created, requested_model, {"content": chunk}
+                        )
+                        continue
+
+                    held = "".join(buffer)
+                    if tools_mod.has_dsml(held) or _looks_like_tool_start(held):
+                        # Masih mungkin tool call -> tahan.
+                        continue
+
+                    if len(held) >= HOLD_CHARS:
+                        # Cukup panjang dan bukan tool call -> lepas semuanya.
+                        decided = True
+                        yield _sse_chunk(
+                            completion_id, created, requested_model, {"content": held}
+                        )
+                        buffer = []
+            except Exception as exc:  # noqa: BLE001
+                yield _sse_error(completion_id, created, requested_model, str(exc))
+                return
+
+            # Stream selesai: isi percakapan sudah diterima sesi DeepSeek,
+            # jadi giliran berikutnya cukup mengirim pesan baru.
+            _mark_history_sent()
+
+            tail = "".join(buffer)
+            if tail:
+                content, tool_calls = tools_mod.parse_response(tail, request_tools)
+                if content:
+                    yield _sse_chunk(
+                        completion_id, created, requested_model, {"content": content}
+                    )
+                if tool_calls:
+                    for index, call in enumerate(tool_calls):
+                        yield _sse_tool_call_delta(
+                            completion_id, created, requested_model, index, call
+                        )
                     yield _sse_chunk(
                         completion_id,
                         created,
                         requested_model,
-                        {"reasoning_content": chunk},
+                        {},
+                        finish_reason="tool_calls",
                     )
-                    continue
+                    yield b"data: [DONE]\n\n"
+                    return
 
-                buffer.append(chunk)
+            yield _sse_chunk(
+                completion_id, created, requested_model, {}, finish_reason="stop"
+            )
+            yield b"data: [DONE]\n\n"
 
-                if decided:
-                    yield _sse_chunk(
-                        completion_id, created, requested_model, {"content": chunk}
-                    )
-                    continue
+        async def event_stream() -> AsyncIterator[bytes]:
+            """Teruskan chunk, lalu lepaskan kunci percakapan apa pun hasilnya."""
+            try:
+                async for chunk in _event_stream_body():
+                    yield chunk
+            finally:
+                if conv_guard.locked():
+                    conv_guard.release()
 
-                held = "".join(buffer)
-                if tools_mod.has_dsml(held) or _looks_like_tool_start(held):
-                    # Masih mungkin tool call -> tahan.
-                    continue
-
-                if len(held) >= HOLD_CHARS:
-                    # Cukup panjang dan bukan tool call -> lepas semuanya.
-                    decided = True
-                    yield _sse_chunk(
-                        completion_id, created, requested_model, {"content": held}
-                    )
-                    buffer = []
-        except Exception as exc:  # noqa: BLE001
-            yield _sse_error(completion_id, created, requested_model, str(exc))
-            return
-
-        # Stream selesai: isi percakapan sudah diterima sesi DeepSeek, jadi
-        # giliran berikutnya cukup mengirim pesan baru.
-        _mark_history_sent()
-
-        tail = "".join(buffer)
-        if tail:
-            content, tool_calls = tools_mod.parse_response(tail, request_tools)
-            if content:
-                yield _sse_chunk(
-                    completion_id, created, requested_model, {"content": content}
-                )
-            if tool_calls:
-                for index, call in enumerate(tool_calls):
-                    yield _sse_tool_call_delta(
-                        completion_id, created, requested_model, index, call
-                    )
-                yield _sse_chunk(
-                    completion_id,
-                    created,
-                    requested_model,
-                    {},
-                    finish_reason="tool_calls",
-                )
-                yield b"data: [DONE]\n\n"
-                return
-
-        yield _sse_chunk(
-            completion_id, created, requested_model, {}, finish_reason="stop"
+        response = StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
-        yield b"data: [DONE]\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+        handed_off = True
+        return response
+    finally:
+        # Jalur non-streaming dan semua error/path pendek melepas kunci di
+        # sini. Jalur streaming sudah menyerahkannya ke generator.
+        if not handed_off and conv_guard.locked():
+            conv_guard.release()
 
 
 def _looks_like_tool_start(text: str) -> bool:
@@ -1063,6 +1161,49 @@ def _describe_port(port: int) -> str:
     return str(port)
 
 
+def is_loopback_host(host: str) -> bool:
+    """True hanya bila ``host`` pasti mengarah ke mesin ini sendiri.
+
+    ``0.0.0.0`` / ``::`` / alamat LAN / hostname yang tidak dikenal dianggap
+    **bukan** loopback, karena semuanya mengekspos gateway ke pihak lain.
+    """
+    value = (host or "").strip().lower().rstrip(".")
+    if value in ("localhost", "ip6-localhost"):
+        return True
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        # Hostname / wildcard: tidak bisa dibuktikan aman -> anggap publik.
+        return False
+
+
+def _enforce_bind_policy(host: str) -> None:
+    """Tolak bind non-loopback bila autentikasi masih terbuka.
+
+    Mode ``open`` (default) menerima key apa pun, bahkan tanpa key. Itu aman
+    hanya selama server mendengar di 127.0.0.1. Begitu ``--host 0.0.0.0``
+    atau alamat LAN dipakai, siapa pun di jaringan bisa memakai akun
+    DeepSeek pemilik, jadi wajib mode ``strict`` + ``DEEPSEEK_API_KEY``.
+    """
+    if is_loopback_host(host):
+        return
+    mode = auth_mod.current_mode()
+    if mode == "strict" and auth_mod.expected_key():
+        return
+    print(
+        f"ERROR: bind ke '{host}' mengekspos gateway ke jaringan, tetapi "
+        f"mode API key masih '{mode}'.\n"
+        "  Siapkan autentikasi sebelum membuka akses jaringan:\n"
+        "    set DEEPSEEK_API_KEY=sk-rahasia-saya\n"
+        "    set DEEPSEEK_AUTH_MODE=strict\n"
+        "  Atau jalankan server hanya di localhost (default 127.0.0.1).",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def main() -> None:
     import uvicorn
 
@@ -1115,6 +1256,9 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    # Jangan pernah mengekspos mode 'open'/'any' ke jaringan.
+    _enforce_bind_policy(args.host)
 
     requested = args.port
     if requested is None:

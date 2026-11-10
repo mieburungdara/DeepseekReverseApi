@@ -21,6 +21,7 @@ Kunci percakapan ditentukan dari request klien:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -47,6 +48,8 @@ class Conversation:
     history_len: int = 0
     #: True bila sesi DeepSeek sudah pernah menerima isi percakapan ini.
     seeded: bool = False
+    #: Mode model yang dipakai saat sesi DeepSeek dibuat.
+    model_type: str = "default"
 
 
 def messages_fingerprint(messages: list[dict[str, Any]]) -> str:
@@ -116,12 +119,46 @@ def conversation_key(
 
 
 class SessionStore:
-    """Penyimpanan sesi in-memory, aman untuk dipakai async."""
+    """Penyimpanan sesi in-memory.
+
+    Operasi dict di sini bersifat sinkron (atomik di satu event loop), tetapi
+    **alur** yang menggunakannya tidak: server melakukan ``await`` (mis.
+    ``create_session``) di antara ``get`` dan ``put``. Untuk itu tersedia
+    :meth:`guard` — satu ``asyncio.Lock`` per percakapan yang dipegang
+    pemanggil selama satu giliran penuh.
+    """
 
     def __init__(self, *, max_conversations: int = 200, ttl_seconds: float = 6 * 3600) -> None:
         self._items: dict[str, Conversation] = {}
         self._max = max_conversations
         self._ttl = ttl_seconds
+        #: Kunci per-conversation. Loop disimpan karena ``asyncio.Lock``
+        #: terikat ke loop tempat pertama kali ia dipakai (uji sering
+        #: membuat loop baru lewat ``asyncio.run``).
+        self._guards: dict[str, asyncio.Lock] = {}
+        self._guard_loops: dict[str, asyncio.AbstractEventLoop] = {}
+
+    def guard(self, key: str) -> asyncio.Lock:
+        """Kunci async untuk satu percakapan (dipakai sebagai ``async with``).
+
+        Kunci dibuat malas dan dibuat ulang bila event loop berganti,
+        sehingga aman dipakai lintas ``asyncio.run`` maupun uji.
+        """
+        loop = asyncio.get_running_loop()
+        lock = self._guards.get(key)
+        if lock is None or self._guard_loops.get(key) is not loop:
+            lock = asyncio.Lock()
+            self._guards[key] = lock
+            self._guard_loops[key] = loop
+        return lock
+
+    def _prune_guards(self) -> None:
+        """Buang kunci yang sudah tidak terpakai (jangan yang sedang dipegang)."""
+        for key in list(self._guards):
+            lock = self._guards[key]
+            if key not in self._items and not lock.locked():
+                self._guards.pop(key, None)
+                self._guard_loops.pop(key, None)
 
     # ------------------------------------------------------------------ API
     def get(self, key: str) -> Optional[Conversation]:
@@ -139,10 +176,15 @@ class SessionStore:
         conv = self._items.get(key)
         now = time.time()
         if conv is None:
-            conv = Conversation(key=key, chat_session_id=chat_session_id)
+            conv = Conversation(
+                key=key,
+                chat_session_id=chat_session_id,
+                model_type=model_type,
+            )
             self._items[key] = conv
         conv.chat_session_id = chat_session_id
         conv.parent_message_id = parent_message_id
+        conv.model_type = model_type
         conv.updated_at = now
         conv.turns += 1
         self._evict()
@@ -217,6 +259,7 @@ class SessionStore:
 
     def clear(self) -> None:
         self._items.clear()
+        self._prune_guards()
 
     def stats(self) -> dict[str, Any]:
         self._evict()
@@ -248,6 +291,7 @@ class SessionStore:
             ordered = sorted(self._items.items(), key=lambda kv: kv[1].updated_at)
             for key, _ in ordered[: len(self._items) - self._max]:
                 self._items.pop(key, None)
+        self._prune_guards()
 
 
 #: Store global yang dipakai server.

@@ -39,7 +39,7 @@ from .http import (
     make_client,
     unwrap_envelope,
 )
-from .config import min_interval
+from .config import min_interval, pow_timeout
 from .pow import PowChallenge, PowError, solve_to_answer
 from .stream import DeltaAccumulator
 
@@ -126,6 +126,10 @@ class DeepSeekWebClient:
         #: Jeda minimum antar-pesan (detik) agar tidak kena rate limit.
         self._min_interval = min_interval()
         self._last_chat_at = 0.0
+        #: Serialisasi pembacaan/penulisan ``_last_chat_at``. Tanpa ini dua
+        #: request bersamaan menghitung jeda dari timestamp yang sama lalu
+        #: berangkat bersamaan, sehingga throttle tidak berguna.
+        self._throttle_lock = asyncio.Lock()
         self._http = client
         self._owns_http = client is None
 
@@ -277,8 +281,25 @@ class DeepSeekWebClient:
         sedangkan challenge baru selalu berhasil.
         """
         challenge = await self.create_pow_challenge(target_path)
+
+        # Solver PoW adalah kerja CPU murni: native ~0,1 detik, fallback Python
+        # bisa menit-an. Menjalankannya langsung di sini akan membekukan event
+        # loop (semua request lain, termasuk /healthz, ikut berhenti).
+        # ``to_thread`` melepas GIL lewat ctypes / interpreter dan menjaga
+        # server tetap responsif; ``wait_for`` memberi batas waktu.
+        timeout = pow_timeout()
         try:
-            answer = solve_to_answer(challenge, target_path)
+            coro = asyncio.to_thread(solve_to_answer, challenge, target_path)
+            if timeout > 0:
+                answer = await asyncio.wait_for(coro, timeout=timeout)
+            else:
+                answer = await coro
+        except asyncio.TimeoutError as exc:
+            raise DeepSeekWebError(
+                f"PoW melebihi batas waktu {timeout:g} detik "
+                "(DEEPSEEK_POW_TIMEOUT). Solver native tidak tersedia atau "
+                "difficulty terlalu tinggi."
+            ) from exc
         except PowError as exc:
             raise DeepSeekWebError(str(exc)) from exc
 
@@ -378,11 +399,15 @@ class DeepSeekWebClient:
         interval = self._min_interval if self._min_interval else min_interval()
         if interval <= 0:
             return
-        now = time.monotonic()
-        wait = interval - (now - self._last_chat_at)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last_chat_at = time.monotonic()
+        # Kunci harus dipegang *selama* menunggu, bukan hanya saat menulis:
+        # kalau tidak, permintaan kedua ikut tidur dengan jeda yang sama dan
+        # keduanya berangkat berbarengan.
+        async with self._throttle_lock:
+            now = time.monotonic()
+            wait = interval - (now - self._last_chat_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_chat_at = time.monotonic()
 
     async def stream_completion(
         self,

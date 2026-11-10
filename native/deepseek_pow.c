@@ -131,14 +131,50 @@ static void to_hex(const uint8_t *in, int len, char *out)
 }
 
 /*
+ * Pastikan `target` tepat 64 karakter hex, lalu salin ke `out` dalam
+ * huruf kecil. Ini WAJIB sebelum memcmp 64 byte: `target` berasal dari
+ * respons jaringan, jadi bisa saja pendek/rusak. Membaca 64 byte dari
+ * string yang lebih pendek adalah out-of-bounds read.
+ *
+ * Pemeriksaan berhenti lebih awal saat menemukan NUL, sehingga tidak
+ * pernah membaca melewati akhir string yang sebenarnya.
+ */
+static int normalize_target(const char *target, char out[65])
+{
+    int i;
+    if (target == NULL)
+        return 0;
+    for (i = 0; i < 64; i++) {
+        char c = target[i];
+        if (c >= '0' && c <= '9') {
+            out[i] = c;
+        } else if (c >= 'A' && c <= 'F') {
+            out[i] = (char)(c - 'A' + 'a');
+        } else if (c >= 'a' && c <= 'f') {
+            out[i] = c;
+        } else {
+            return 0;  /* karakter bukan hex, atau string terlalu pendek */
+        }
+    }
+    if (target[64] != '\0')
+        return 0;      /* string lebih panjang dari 64 karakter */
+    out[64] = '\0';
+    return 1;
+}
+
+/*
  * Ekspor utama: cari jawaban PoW.
  *
  *   prefix    : string prefix (salt_expire_at_)
- *   target    : 64 karakter hex target
+ *   target    : 64 karakter hex target (WAJIB, divalidasi)
  *   difficulty: batas atas pencarian (eksklusif)
- *   threads   : jumlah thread (0/1 = single thread)
  *
- * Return: nilai i jika ketemu, -1 jika tidak.
+ * Return:
+ *   >= 0  nilai i yang ditemukan
+ *   -1    tidak ada solusi dalam `difficulty` iterasi
+ *   -2    prefix terlalu panjang untuk buffer
+ *   -3    target bukan 64 karakter hex
+ *   -4    argumen tidak valid (NULL / difficulty <= 0)
  */
 #ifdef _WIN32
 __declspec(dllexport)
@@ -146,11 +182,18 @@ __declspec(dllexport)
 long long deepseek_pow_solve(const char *prefix, const char *target, long long difficulty)
 {
     char buf[512];
-    size_t plen = strlen(prefix);
+    size_t plen;
     char hex[65];
+    char expected[65];
     uint8_t digest[OUTPUT_LEN];
     long long i;
 
+    if (prefix == NULL || target == NULL || difficulty <= 0)
+        return -4;
+    if (!normalize_target(target, expected))
+        return -3;
+
+    plen = strlen(prefix);
     if (plen + 24 >= sizeof(buf))
         return -2;
 
@@ -158,12 +201,15 @@ long long deepseek_pow_solve(const char *prefix, const char *target, long long d
 
     for (i = 0; i < difficulty; i++) {
         int n = snprintf(buf + plen, sizeof(buf) - plen, "%lld", i);
-        size_t total = plen + (size_t)n;
+        size_t total;
+        if (n < 0)
+            return -4;
+        total = plen + (size_t)n;
 
         keccak_hash((const uint8_t *)buf, total, digest, 1);
         to_hex(digest, OUTPUT_LEN, hex);
 
-        if (memcmp(hex, target, 64) == 0)
+        if (memcmp(hex, expected, 64) == 0)
             return i;
     }
     return -1;
@@ -179,6 +225,8 @@ __declspec(dllexport)
 void deepseek_hash(const char *msg, char *out_hex, int deepseek)
 {
     uint8_t digest[OUTPUT_LEN];
+    if (msg == NULL || out_hex == NULL)
+        return;
     keccak_hash((const uint8_t *)msg, strlen(msg), digest, deepseek);
     to_hex(digest, OUTPUT_LEN, out_hex);
 }

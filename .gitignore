@@ -23,3 +23,6 @@ _re/
 
 # Data percakapan pribadi
 contoh.txt
+
+# Catatan sesi kerja otomatis
+.workbuddy-ai/

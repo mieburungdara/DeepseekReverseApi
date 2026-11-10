@@ -204,6 +204,11 @@ kolom API key diisi. Gateway ini punya tiga mode:
 | `any` | Key apa pun diterima **asalkan tidak kosong** | Ingin agen tetap "login" |
 | `strict` | Harus sama dengan `DEEPSEEK_API_KEY` | Server diekspos ke jaringan |
 
+> **Bind ke jaringan wajib `strict`.** `--host 0.0.0.0`, alamat LAN, atau
+> hostname selain loopback (`127.0.0.1` / `localhost` / `::1`) **ditolak** saat
+> startup bila mode masih `open`/`any` atau `DEEPSEEK_API_KEY` belum diset.
+> Mode default memang tanpa autentikasi, jadi ia hanya aman di localhost.
+
 **Jadi pada mode default, isi kolom API key dengan string apa saja** — misal
 `sk-lokal`, `123`, atau `bebas`. Semua berhasil.
 
@@ -495,12 +500,34 @@ client.chat.completions.create(
 
 - **PoW sekali pakai.** Setiap request chat butuh challenge baru (~0,11 s dengan
   solver native). Memakai ulang jawaban membuat server membalas stream kosong.
+  Solver dijalankan di thread terpisah agar tidak membekukan server; batas
+  waktunya diatur lewat `DEEPSEEK_POW_TIMEOUT` (default 180 detik, `0` = tanpa
+  batas). Target challenge divalidasi tepat 64 karakter hex sebelum masuk ke
+  solver native.
 - **Rate limit (`Messages too frequent`).** Bila pesan dikirim terlalu rapat,
   DeepSeek membalas event `hint` berisi *"Messages too frequent. Try again
   later."* lalu menutup stream tanpa jawaban. Gateway mengubahnya menjadi
   **HTTP 429** dengan `Retry-After`, bukan "jawaban kosong".
-  Atur jeda antar-pesan dengan `DEEPSEEK_MIN_INTERVAL` (default 2 detik,
-  `0` = matikan).
+  Atur jeda antar-pesan dengan `DEEPSEEK_MIN_INTERVAL` (default 5 detik,
+  `0` = matikan). Jeda ini terserialisasi, jadi request konkuren tidak bisa
+  berangkat bersamaan.
+- **Retry otomatis.** Sebelum menyerah, gateway mencoba ulang sendiri dengan
+  backoff eksponensial (1s → 2s → 4s, jitter ±20%). Yang diulang hanya error
+  sementara: `rate_limit` (429), `challenge_required` (hCaptcha), dan PoW
+  kedaluwarsa (40301/40304). Error auth dan request invalid tidak diulang.
+
+  | Variabel | Default | Arti |
+  |---|---|---|
+  | `DEEPSEEK_MAX_RETRIES` | `3` | Percobaan tambahan setelah percobaan pertama. `0` = matikan retry. |
+  | `DEEPSEEK_RETRY_BASE` | `1.0` | Jeda dasar (detik); percobaan ke-n menunggu `base × 2ⁿ`. |
+  | `DEEPSEEK_RETRY_MAX` | `16.0` | Batas atas jeda satu percobaan (detik). |
+
+  Saat retry terjadi, server mencetak
+  `[deepseek] retry 1/3 dalam 1.0s: ...` ke stderr.
+
+  > Pada mode streaming, retry hanya dilakukan **sebelum** byte pertama dikirim
+  > ke klien. Setelah sebagian jawaban tampil, error diteruskan apa adanya —
+  > mengulang akan menduplikasi teks yang sudah dilihat pengguna.
 - **hCaptcha (40303 CHALLENGE_REQUIRED).** DeepSeek kadang meminta verifikasi
   captcha. Gateway melaporkannya sebagai error `429 challenge_required`
   (bukan "jawaban kosong"). Selesaikan captcha di browser, lalu coba lagi.

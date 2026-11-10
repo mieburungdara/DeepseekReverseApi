@@ -24,12 +24,10 @@ import base64
 import ctypes
 import json
 import os
-import shutil
-import subprocess
-import tempfile
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from .keccak23 import DEEPSEEK_ROUNDS, deepseek_hash_v1, keccak_hex
 
@@ -37,6 +35,10 @@ ALGORITHM = "DeepSeekHashV1"
 
 #: Batas aman agar tidak menggantung bila server memberi difficulty aneh.
 MAX_ITERATIONS = 50_000_000
+
+#: Target PoW harus tepat 64 karakter hex (32 byte). Solver native membaca
+#: 64 byte dari string ini, jadi panjangnya wajib diverifikasi sebelum masuk C.
+_TARGET_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DLL_CANDIDATES = (
@@ -64,13 +66,45 @@ class PowChallenge:
     expire_after: Optional[int] = None
 
     @classmethod
-    def from_api(cls, data: dict) -> "PowChallenge":
+    def from_api(cls, data: Any) -> "PowChallenge":
+        """Bangun challenge dari respons API, dengan validasi ketat.
+
+        Respons ini datang dari jaringan dan nilainya diteruskan ke solver C
+        (yang membaca 64 byte dari ``challenge``). Semua field wajib
+        divalidasi di sini supaya payload rusak tidak bisa menyebabkan
+        out-of-bounds read atau loop tak berujung.
+        """
+        if not isinstance(data, dict):
+            raise PowError(f"Challenge bukan objek JSON: {type(data).__name__}")
+
+        missing = [k for k in ("algorithm", "challenge", "salt", "difficulty")
+                   if data.get(k) is None]
+        if missing:
+            raise PowError(f"Challenge tidak lengkap, kurang: {', '.join(missing)}")
+
+        challenge = data["challenge"]
+        if not isinstance(challenge, str) or not _TARGET_RE.fullmatch(challenge):
+            raise PowError(
+                "Challenge target harus tepat 64 karakter hex "
+                f"(didapat {type(challenge).__name__}, "
+                f"panjang {len(challenge) if isinstance(challenge, str) else 'n/a'})"
+            )
+
+        salt = data["salt"]
+        if not isinstance(salt, str) or not salt:
+            raise PowError("Challenge salt harus string tidak kosong")
+
+        try:
+            difficulty = int(data["difficulty"])
+        except (TypeError, ValueError) as exc:
+            raise PowError(f"Challenge difficulty tidak valid: {data['difficulty']!r}") from exc
+
         return cls(
-            algorithm=data["algorithm"],
-            challenge=data["challenge"],
-            salt=data["salt"],
-            difficulty=int(data["difficulty"]),
-            signature=data.get("signature", ""),
+            algorithm=str(data["algorithm"]),
+            challenge=challenge.lower(),
+            salt=salt,
+            difficulty=difficulty,
+            signature=str(data.get("signature") or ""),
             expire_at=data.get("expire_at", data.get("expireAt")),
             expire_after=data.get("expire_after", data.get("expireAfter")),
         )
@@ -157,6 +191,10 @@ def _solve_native(prefix: str, target: str, difficulty: int) -> int:
     )
     if result == -2:
         raise PowError("Prefix terlalu panjang untuk buffer native")
+    if result == -3:
+        raise PowError("Solver native menolak target (bukan 64 karakter hex)")
+    if result == -4:
+        raise PowError("Argumen solver native tidak valid")
     if result < 0:
         raise PowError(
             f"Tidak ada solusi dalam {difficulty} iterasi "
@@ -191,6 +229,12 @@ def solve(challenge: PowChallenge, *, backend: str = "auto") -> tuple[int, str]:
 
     prefix = challenge.prefix()
     target = challenge.challenge.lower()
+
+    # Pertahanan kedua: ``from_api`` sudah memvalidasi, tetapi ``PowChallenge``
+    # juga bisa dibangun langsung (self-test, library). Jangan pernah biarkan
+    # target yang bukan 64 hex masuk ke solver native.
+    if not _TARGET_RE.fullmatch(target):
+        raise PowError("Target PoW harus tepat 64 karakter hex")
 
     if backend in ("auto", "native") and _NATIVE is not None:
         try:
